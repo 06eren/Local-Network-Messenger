@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yerel Ag Mesajlasma</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            headline: ["Space Grotesk", "sans-serif"],
+            body: ["Manrope", "sans-serif"],
+          },
+          colors: {
+            ink: {
+              900: "#0F172A",
+              700: "#334155",
+              500: "#64748B",
+            },
+            tide: "#0EA5A0",
+            tideDark: "#0F766E",
+            sand: "#F4A261",
+            mist: "#F5F7FB",
+          },
+          boxShadow: {
+            soft: "0 30px 70px rgba(15, 23, 42, 0.18)",
+          },
+        },
+      },
+    };
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="./app.js" defer></script>
+</head>
+<body class="h-screen overflow-hidden bg-mist font-body text-ink-900">
+  <div class="relative h-full overflow-hidden">
+    <div class="pointer-events-none absolute -left-32 -top-28 h-72 w-72 rounded-full bg-tide/25 blur-3xl"></div>
+    <div class="pointer-events-none absolute right-10 top-24 h-56 w-56 rounded-full bg-sand/25 blur-3xl"></div>
+    <div class="pointer-events-none absolute bottom-10 left-1/2 h-80 w-80 -translate-x-1/2 rounded-full bg-tideDark/15 blur-3xl"></div>
+
+    <main class="relative h-full w-full">
+      <section class="auth-shell mx-auto flex h-full min-h-0 w-full max-w-6xl flex-col gap-6 px-4 py-4 lg:px-6 lg:py-6" data-view="auth">
+        <header class="flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <div class="flex h-12 w-12 items-center justify-center overflow-hidden rounded-2xl bg-white/90 shadow-soft">
+              <img src="./innoapplogo.png" alt="Yerel Ag Mesajlasma" class="h-8 w-8 object-contain" />
+            </div>
+            <div>
+              <p class="text-xs uppercase tracking-[0.35em] text-ink-500">Yerel Ag</p>
+              <h1 class="font-headline text-2xl">Mesajlasma</h1>
+            </div>
+          </div>
+          <div class="rounded-full border border-white/70 bg-white/80 px-4 py-2 text-xs uppercase tracking-[0.2em] text-ink-500 shadow-soft">
+            Yerel baglanti
+          </div>
+        </header>
+
+        <div class="grid h-full min-h-0 gap-6 lg:grid-cols-[1fr_1.1fr]">
+          <aside class="relative flex h-full min-h-0 flex-col overflow-hidden rounded-[28px] bg-gradient-to-br from-[#0F766E] via-[#0EA5A0] to-[#047857] p-8 text-white shadow-soft reveal">
+            <div class="absolute right-6 top-6 h-16 w-16 rounded-full border border-white/30"></div>
+            <div class="absolute right-16 top-16 h-3 w-3 rounded-full bg-sand"></div>
+
+            <div class="scroll-area flex min-h-0 flex-1 flex-col gap-6 pr-2">
+              <div>
+                <h2 class="font-headline text-[28px] leading-tight">Ayni agda modern ve kolay sohbet</h2>
+                <p class="mt-3 text-sm leading-relaxed text-emerald-100/90">
+                  Yerel agdaki tanidiklarla hizlica mesajlas, dosya paylas ve sohbeti tek ekranda surdur.
+                </p>
+              </div>
+
+              <div class="grid gap-3 text-sm text-emerald-100/90">
+                <div class="flex items-start gap-3">
+                  <div class="mt-1 h-2 w-2 rounded-full bg-sand"></div>
+                  <p>Hizli kayit ve kolay giris.</p>
+                </div>
+                <div class="flex items-start gap-3">
+                  <div class="mt-1 h-2 w-2 rounded-full bg-sand"></div>
+                  <p>Mesajlar sadece yerel agda kalir.</p>
+                </div>
+                <div class="flex items-start gap-3">
+                  <div class="mt-1 h-2 w-2 rounded-full bg-sand"></div>
+                  <p>Dosya gonderimi icin ek guvenlik kontrolleri.</p>
+                </div>
+              </div>
+
+              <div class="rounded-2xl border border-white/20 bg-white/10 p-4 text-xs text-emerald-100/90">
+                Gizliligin senin kontrolunde. Hesabini istedigin zaman yonetebilirsin.
+              </div>
+            </div>
+          </aside>
+
+          <section class="flex h-full min-h-0 flex-col rounded-[28px] border border-white/70 bg-white/90 p-8 shadow-soft backdrop-blur-xl reveal delay-1">
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <h2 class="font-headline text-[28px]" data-mode-title>Tekrar hos geldin</h2>
+                <p class="mt-2 text-sm text-ink-500" data-mode-subtitle>Yerel ag icindeki kisilerle baglanti kur.</p>
+              </div>
+              <div class="flex items-center gap-2 rounded-full bg-slate-100 p-1">
+                <button class="mode-btn is-active" data-mode="login" aria-pressed="true">Giris</button>
+                <button class="mode-btn" data-mode="register" aria-pressed="false">Kayit</button>
+              </div>
+            </div>
+
+            <div class="scroll-area mt-6 flex min-h-0 flex-1 flex-col gap-4 pr-2">
+              <div class="grid gap-4">
+                <label class="grid gap-2">
+                  <span class="text-[11px] uppercase tracking-[0.3em] text-ink-500">Kullanici adi</span>
+                  <input class="input-field" data-field="username" placeholder="ornek: yeni_user" type="text" autocomplete="off" />
+                  <span class="field-error hidden" data-error="username"></span>
+                </label>
+
+                <label class="grid gap-2 hidden" data-auth="register">
+                  <span class="text-[11px] uppercase tracking-[0.3em] text-ink-500">Gorunen ad</span>
+                  <input class="input-field" data-field="displayName" placeholder="ornek: Elif Y." type="text" autocomplete="off" />
+                  <span class="field-error hidden" data-error="displayName"></span>
+                </label>
+
+                <label class="grid gap-2" data-auth="login">
+                  <span class="text-[11px] uppercase tracking-[0.3em] text-ink-500">Sifre</span>
+                  <input class="input-field" data-field="password" placeholder="******" type="password" autocomplete="off" />
+                  <span class="field-error hidden" data-error="password"></span>
+                </label>
+
+                <label class="grid gap-2 hidden" data-auth="register">
+                  <span class="text-[11px] uppercase tracking-[0.3em] text-ink-500">Sifre</span>
+                  <input class="input-field" data-field="registerPassword" placeholder="******" type="password" autocomplete="off" />
+                  <span class="field-error hidden" data-error="password"></span>
+                </label>
+
+                <label class="grid gap-2 hidden" data-auth="register">
+                  <span class="text-[11px] uppercase tracking-[0.3em] text-ink-500">Sifre tekrar</span>
+                  <input class="input-field" data-field="confirmPassword" placeholder="******" type="password" autocomplete="off" />
+                  <span class="field-error hidden" data-error="confirmPassword"></span>
+                </label>
+              </div>
+
+              <div class="grid gap-3">
+                <button class="primary-btn" data-action="login" data-auth="login">Giris yap</button>
+                <button class="primary-btn hidden" data-action="register" data-auth="register">Kayit ol</button>
+              </div>
+
+              <div class="status hidden" data-status data-tone="info"></div>
+
+              <div class="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-4 text-xs text-emerald-900">
+                Guvenli giris ve kolay kayit. Kisisel bilgiler sadece burada kalir.
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="chat-shell hidden" data-view="chat">
+        <div class="chat-frame">
+          <aside class="chat-rail">
+            <div class="rail-header">
+              <div class="rail-logo">
+                <img src="./innoapplogo.png" alt="Yerel Ag Mesajlasma" class="h-9 w-9" />
+              </div>
+              <div class="rail-title">
+                <div class="rail-name">Sohbetler</div>
+                <div class="rail-sub" data-user-name>Baglanti bekleniyor...</div>
+              </div>
+            </div>
+
+            <div class="rail-search">
+              <input class="rail-input" data-search placeholder="Kullanici ara" type="text" />
+              <button class="rail-search-btn" type="button" data-search-btn>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="6" fill="none" stroke="currentColor" stroke-width="1.6" />
+                  <path d="m16 16 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="rail-section">
+              <span>AGDAKI KULLANICILAR</span>
+              <span class="rail-count" data-network-count>0 kisi</span>
+            </div>
+
+            <div class="scroll-area rail-list" data-contacts>
+              <div class="empty-state">Kisi listesi yukleniyor...</div>
+            </div>
+
+            <div class="rail-footer">
+              <div class="rail-divider"></div>
+              <button class="rail-settings-btn" type="button" aria-label="Ayarlar" title="Ayarlar" data-settings-open>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 8.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7Z" fill="none" stroke="currentColor" stroke-width="1.6" />
+                  <path d="M19.4 15.1a7.8 7.8 0 0 0 .1-1.1 7.8 7.8 0 0 0-.1-1.1l2-1.6-2-3.4-2.4 1a7.7 7.7 0 0 0-1.9-1.1l-.4-2.6h-4l-.4 2.6a7.7 7.7 0 0 0-1.9 1.1l-2.4-1-2 3.4 2 1.6a7.8 7.8 0 0 0-.1 1.1c0 .4 0 .7.1 1.1l-2 1.6 2 3.4 2.4-1a7.7 7.7 0 0 0 1.9 1.1l.4 2.6h4l.4-2.6a7.7 7.7 0 0 0 1.9-1.1l2.4 1 2-3.4-2-1.6Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+                </svg>
+              </button>
+            </div>
+          </aside>
+
+          <section class="chat-room" data-dropzone>
+            <header class="room-header">
+              <div class="room-title">
+                <div class="room-avatar" data-chat-avatar>LN</div>
+                <div>
+                  <h3 data-chat-title>Secili kisi yok</h3>
+                  <p data-chat-status>Bir sohbet sec.</p>
+                </div>
+              </div>
+            </header>
+
+            <div class="drop-overlay hidden" data-drop-overlay>
+              <div class="drop-card">
+                <div class="drop-title">Dosyayi buraya birak</div>
+                <div class="drop-sub">Dosya once taranir, sonra gonderilir.</div>
+              </div>
+            </div>
+
+            <div class="scroll-area room-messages" data-messages>
+              <div class="empty-state">Henuz mesaj yok.</div>
+            </div>
+
+            <footer class="room-compose">
+              <div class="file-chip hidden" data-file-chip>
+                <span data-file-name>dosya.txt</span>
+                <span class="file-size" data-file-size>0 KB</span>
+                <button class="chip-remove" type="button" data-file-clear>Temizle</button>
+              </div>
+              <div class="compose-row">
+                <label class="icon-btn" title="Dosya ekle" data-file-pick>
+                  <input type="file" class="hidden" data-file-input />
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M16.5 6.5V16a4.5 4.5 0 0 1-9 0V6.5a3.5 3.5 0 1 1 7 0V15a2.5 2.5 0 1 1-5 0V7.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </label>
+                <textarea class="compose-input" rows="2" data-compose placeholder="Mesaj yaz..."></textarea>
+                <button class="primary-btn send-btn" data-send>Gonder</button>
+              </div>
+              <div class="status hidden" data-chat-status-line data-tone="info"></div>
+            </footer>
+          </section>
+        </div>
+
+        <div class="settings-overlay hidden" data-settings-panel>
+          <div class="settings-backdrop" data-settings-backdrop></div>
+          <div class="settings-sheet" role="dialog" aria-modal="true" aria-label="Hesap Ayarlari">
+            <div class="settings-header">
+              <div>
+                <div class="settings-title">Hesap Ayarlari</div>
+                <div class="settings-user" data-account-name>Baglanti bekleniyor...</div>
+              </div>
+              <button class="settings-close" type="button" aria-label="Kapat" data-settings-close>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+
+            <div class="settings-body scroll-area">
+              <section class="settings-section">
+                <div class="settings-section-title">Hesap</div>
+                <div class="settings-card">
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Profil</div>
+                      <div class="settings-item-desc" data-account-name>Baglanti bekleniyor...</div>
+                    </div>
+                  </div>
+                  <div class="settings-item">
+                    <label class="settings-label" for="rename-input">Kullanici adi degistir</label>
+                    <div class="settings-row">
+                      <input id="rename-input" class="settings-input" data-rename-input placeholder="yeni_kullanici" type="text" autocomplete="off" />
+                      <button class="settings-btn" type="button" data-rename-btn>Kaydet</button>
+                    </div>
+                  </div>
+                  <div class="settings-item">
+                    <label class="settings-label" for="displayname-input">Gorunen ad</label>
+                    <div class="settings-row">
+                      <input id="displayname-input" class="settings-input" data-displayname-input placeholder="Ornek: Ece Kaya" type="text" autocomplete="off" />
+                      <button class="settings-btn" type="button" data-displayname-btn>Guncelle</button>
+                    </div>
+                  </div>
+                  <button class="settings-logout" type="button" data-logout-btn>Cikis yap</button>
+                  <div class="settings-status hidden" data-account-status></div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Guvenlik</div>
+                <div class="settings-card">
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Iki Adimli Dogrulama (2FA)</div>
+                      <div class="settings-item-desc">Hesabina ekstra guvenlik katmani ekle.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" data-setting="twoFactor" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">2FA Yontemi</div>
+                      <div class="settings-item-desc">Authenticator veya SMS sec.</div>
+                    </div>
+                    <select class="settings-select" data-setting="twoFactorMethod">
+                      <option>Authenticator</option>
+                      <option>SMS</option>
+                    </select>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Yeni Cihaz Onayi</div>
+                    <div class="settings-item-desc">Yeni cihazlarda onay iste.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="deviceApproval" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <button class="settings-secondary" type="button">Yedek Kodlari Goruntule</button>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Gizlilik</div>
+                <div class="settings-card">
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Son Gorulme</div>
+                      <div class="settings-item-desc">Kimler gorebilir.</div>
+                    </div>
+                    <select class="settings-select" data-setting="lastSeen">
+                      <option>Herkes</option>
+                      <option>Karsilikli</option>
+                      <option>Kimse</option>
+                    </select>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Okundu Bilgisi</div>
+                      <div class="settings-item-desc">Mesaj okundu bilgisini goster.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="readReceipts" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Durum Bilgisi</div>
+                      <div class="settings-item-desc">Aktiflik bilgisini goster.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="presence" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Bildirimler</div>
+                <div class="settings-card">
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Masaustu Bildirimi</div>
+                      <div class="settings-item-desc">Yeni mesajlar icin bildirim goster.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="desktopNotifications" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Ses</div>
+                      <div class="settings-item-desc">Bildirim sesi cal.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="sound" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Mesaj Onizleme</div>
+                      <div class="settings-item-desc">Bildirimde mesaj metni goster.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked data-setting="preview" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Gorunum</div>
+                <div class="settings-card">
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Tema</div>
+                      <div class="settings-item-desc">Uygulama temasi.</div>
+                    </div>
+                    <select class="settings-select" data-setting="theme">
+                      <option>Koyu</option>
+                      <option>Acik</option>
+                      <option>Otomatik</option>
+                    </select>
+                  </div>
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Mesaj Yogunlugu</div>
+                      <div class="settings-item-desc">Mesajlarin araligi.</div>
+                    </div>
+                    <select class="settings-select" data-setting="density">
+                      <option>Rahat</option>
+                      <option>Orta</option>
+                      <option>Sik</option>
+                    </select>
+                  </div>
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Yazi Boyutu</div>
+                      <div class="settings-item-desc">Genel yazi boyutu.</div>
+                    </div>
+                    <select class="settings-select" data-setting="fontSize">
+                      <option>Orta</option>
+                      <option>Kucuk</option>
+                      <option>Buyuk</option>
+                    </select>
+                  </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Yerel Ag</div>
+                <div class="settings-card">
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Genel Sohbeti Goster</div>
+                      <div class="settings-item-desc">Zorunlu: ortak sohbet her zaman acik.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked disabled data-setting="generalChat" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Dosya Tarama</div>
+                      <div class="settings-item-desc">Zorunlu: paylasim oncesi tarama yapilir.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked disabled data-setting="fileScan" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Mesaj Sifreleme</div>
+                      <div class="settings-item-desc">Zorunlu: yerel sifreleme katmani aktif.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" checked disabled />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              <div class="settings-footer">
+                <button class="settings-btn settings-save" type="button" data-settings-save>Ayarlarimi Kaydet</button>
+                <div class="settings-status hidden" data-settings-status></div>
+                <div class="settings-footnote">Ayarlar bu cihazda saklanir.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

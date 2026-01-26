@@ -1,0 +1,1115 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using Microsoft.Web.WebView2.Core;
+using Local_Network_Messenger.Integrations;
+using Local_Network_Messenger.Models;
+using Local_Network_Messenger.Services;
+using Forms = System.Windows.Forms;
+using WpfMessageBox = System.Windows.MessageBox;
+
+namespace Local_Network_Messenger
+{
+    public partial class MainWindow : Window
+    {
+        private const string HostName = "app.local";
+        private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
+        {
+            PropertyNameCaseInsensitive = true
+        };
+        private readonly SessionState _sessionState;
+        private readonly PasswordHasher _hasher;
+        private readonly SessionStore _sessionStore;
+        private IUserStore _userStore;
+        private AuthService _authService;
+        private readonly AppConfig _config;
+        private readonly ICryptoBridge _cryptoBridge;
+        private readonly MessageCipher _messageCipher;
+        private readonly ChatService _chatService;
+        private readonly IFileScanService _fileScanService;
+        private readonly LanTransportService _lanService;
+        private readonly ISentimentService _sentimentService;
+        private ProcessJsonClient? _cryptoClient;
+        private ProcessJsonClient? _scanClient;
+        private Forms.NotifyIcon? _trayIcon;
+        private bool _allowClose;
+        private bool _trayHintShown;
+        private readonly object _snapshotLock = new();
+        private bool _snapshotScheduled;
+        private string _activeThreadId = "all";
+        private SentimentTone _lastTone = SentimentTone.Neutral;
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            _sessionState = new SessionState();
+            _hasher = new PasswordHasher();
+            _sessionStore = new SessionStore(AppPaths.SessionPath);
+            _userStore = new SqliteUserStore(AppPaths.UserDatabasePath);
+            _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore);
+            _config = AppConfig.Load(AppPaths.ConfigPath);
+            _cryptoBridge = CreateCryptoBridge(_config);
+            _messageCipher = new MessageCipher(_cryptoBridge, _config.EffectiveCryptoKeyId);
+            _chatService = new ChatService(_sessionState, _messageCipher);
+            _fileScanService = CreateFileScanService(_config);
+            _lanService = new LanTransportService(
+                _messageCipher,
+                _fileScanService,
+                _config.EffectiveDiscoveryPort,
+                _config.EffectiveTcpPort);
+            _sentimentService = SentimentServiceFactory.Create();
+            _chatService.MessageReceived += OnMessageReceived;
+            _lanService.PeerChanged += OnPeerChanged;
+            _lanService.MessageReceived += OnLanMessageReceived;
+            _lanService.FileReceived += OnLanFileReceived;
+            Loaded += OnLoaded;
+            Closing += OnClosing;
+            Closed += OnClosed;
+            StateChanged += OnStateChanged;
+        }
+
+        private async void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            Loaded -= OnLoaded;
+
+            var webRoot = Path.Combine(AppContext.BaseDirectory, "WebUI");
+            if (!Directory.Exists(webRoot))
+            {
+                WpfMessageBox.Show($"WebUI klasoru bulunamadi: {webRoot}", "WebUI", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            await InitializeUserStoreAsync();
+
+            try
+            {
+                await MessengerView.EnsureCoreWebView2Async();
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show($"WebView2 baslatilamadi: {ex.Message}", "WebView2", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            var settings = MessengerView.CoreWebView2.Settings;
+            settings.AreDefaultContextMenusEnabled = false;
+            settings.AreDevToolsEnabled = false;
+            settings.AreDefaultScriptDialogsEnabled = false;
+            settings.IsStatusBarEnabled = false;
+            settings.IsZoomControlEnabled = false;
+            settings.IsPinchZoomEnabled = false;
+            settings.IsPasswordAutosaveEnabled = false;
+            settings.IsGeneralAutofillEnabled = false;
+            settings.AreBrowserAcceleratorKeysEnabled = false;
+
+            MessengerView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+                HostName,
+                webRoot,
+                CoreWebView2HostResourceAccessKind.DenyCors);
+
+            MessengerView.CoreWebView2.NavigationStarting += OnNavigationStarting;
+            MessengerView.CoreWebView2.ContextMenuRequested += OnContextMenuRequested;
+            MessengerView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+            MessengerView.Source = new Uri($"https://{HostName}/index.html");
+            MessengerView.AllowDrop = true;
+            MessengerView.PreviewDragOver += OnWebViewDragOver;
+            MessengerView.Drop += OnWebViewDrop;
+
+            InitializeTrayIcon();
+        }
+
+        private async Task InitializeUserStoreAsync()
+        {
+            try
+            {
+                await _userStore.InitializeAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"Kalici veritabani baslatilamadi. Gecici bellek kullanilacak.\n{ex.Message}",
+                    "Veritabani",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                _userStore = new InMemoryUserStore();
+                _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore);
+            }
+        }
+
+        private ICryptoBridge CreateCryptoBridge(AppConfig config)
+        {
+            if (!string.IsNullOrWhiteSpace(config.CryptoDllPath) && File.Exists(config.CryptoDllPath))
+            {
+                try
+                {
+                    return new CryptoDllBridge(config.CryptoDllPath);
+                }
+                catch (Exception ex)
+                {
+                    WpfMessageBox.Show(
+                        $"C++ DLL sifreleme yuklenemedi. Proses modu denenecek.\n{ex.Message}",
+                        "Sifreleme",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(config.CryptoExecutable))
+            {
+                return new PassThroughCryptoBridge();
+            }
+
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = config.CryptoExecutable,
+                    Arguments = config.CryptoArguments ?? string.Empty
+                };
+                _cryptoClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(6));
+                return new CryptoProcessBridge(_cryptoClient);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"C++ sifreleme servisi baslatilamadi. Gecici mod kullanilacak.\n{ex.Message}",
+                    "Sifreleme",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return new PassThroughCryptoBridge();
+            }
+        }
+
+        private IFileScanService CreateFileScanService(AppConfig config)
+        {
+            if (PythonNetRuntime.TryInitialize(out var pythonError))
+            {
+                try
+                {
+                    return new PythonNetFileScanService();
+                }
+                catch (Exception ex)
+                {
+                    WpfMessageBox.Show(
+                        $"Python.NET tarama servisi baslatilamadi. Proses modu denenecek.\n{ex.Message}",
+                        "Tarama",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(config.ScanExecutable))
+            {
+                return new FileScanService();
+            }
+
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = config.ScanExecutable,
+                    Arguments = config.ScanArguments ?? string.Empty
+                };
+                _scanClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(8));
+                return new FileScanProcessService(_scanClient);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"Python tarama servisi baslatilamadi. Gecici mod kullanilacak.\n{ex.Message}",
+                    "Tarama",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return new FileScanService();
+            }
+        }
+
+        private void InitializeTrayIcon()
+        {
+            if (_trayIcon != null)
+            {
+                return;
+            }
+
+            _trayIcon = new Forms.NotifyIcon
+            {
+                Text = "Yerel Ag Mesajlasma",
+                Icon = SystemIcons.Application,
+                Visible = true
+            };
+
+            var menu = new Forms.ContextMenuStrip();
+            var openItem = new Forms.ToolStripMenuItem("Ac");
+            openItem.Click += (_, _) => ShowFromTray();
+            var exitItem = new Forms.ToolStripMenuItem("Cikis");
+            exitItem.Click += (_, _) => ExitApplication();
+            menu.Items.Add(openItem);
+            menu.Items.Add(exitItem);
+            _trayIcon.ContextMenuStrip = menu;
+            _trayIcon.DoubleClick += (_, _) => ShowFromTray();
+        }
+
+        private void OnStateChanged(object? sender, EventArgs e)
+        {
+            if (WindowState == WindowState.Minimized)
+            {
+                HideToTray();
+            }
+        }
+
+        private void OnClosing(object? sender, CancelEventArgs e)
+        {
+            if (_allowClose)
+            {
+                return;
+            }
+
+            e.Cancel = true;
+            HideToTray();
+        }
+
+        private async void OnClosed(object? sender, EventArgs e)
+        {
+            _chatService.MessageReceived -= OnMessageReceived;
+            _lanService.PeerChanged -= OnPeerChanged;
+            _lanService.MessageReceived -= OnLanMessageReceived;
+            _lanService.FileReceived -= OnLanFileReceived;
+            await _lanService.DisposeAsync();
+            PythonNetRuntime.Shutdown();
+            if (_cryptoBridge is IDisposable disposableBridge)
+            {
+                disposableBridge.Dispose();
+            }
+            _trayIcon?.Dispose();
+            _trayIcon = null;
+            if (_cryptoClient != null)
+            {
+                await _cryptoClient.DisposeAsync();
+                _cryptoClient = null;
+            }
+
+            if (_scanClient != null)
+            {
+                await _scanClient.DisposeAsync();
+                _scanClient = null;
+            }
+        }
+
+        private void HideToTray()
+        {
+            if (_trayIcon == null)
+            {
+                return;
+            }
+
+            ShowInTaskbar = false;
+            Hide();
+            if (!_trayHintShown)
+            {
+                _trayIcon.ShowBalloonTip(
+                    1500,
+                    "Yerel Ag Mesajlasma",
+                    "Uygulama arka planda calisiyor.",
+                    Forms.ToolTipIcon.Info);
+                _trayHintShown = true;
+            }
+        }
+
+        private void ShowFromTray()
+        {
+            ShowInTaskbar = true;
+            Show();
+            WindowState = WindowState.Normal;
+            Activate();
+        }
+
+        private void ExitApplication()
+        {
+            _allowClose = true;
+            _trayIcon?.Visible = false;
+            Close();
+        }
+
+        private void OnMessageReceived(object? sender, ChatService.ChatNotification notification)
+        {
+            Dispatcher.InvokeAsync(() =>
+            {
+                if (_trayIcon == null)
+                {
+                    return;
+                }
+
+                if (IsVisible && WindowState != WindowState.Minimized)
+                {
+                    return;
+                }
+
+                var title = notification.DisplayName;
+                var text = $"{notification.Sender}: {notification.Text}";
+                _trayIcon.ShowBalloonTip(2000, title, text, Forms.ToolTipIcon.Info);
+            });
+        }
+
+        private void OnPeerChanged(object? sender, PeerChangedEventArgs e)
+        {
+            Dispatcher.InvokeAsync(() =>
+            {
+                _chatService.UpdateContactPresence(
+                    e.Peer.Username,
+                    e.Peer.DisplayName,
+                    e.Peer.IsOnline,
+                    e.Peer.LastSeen);
+                ScheduleSnapshotPush();
+            });
+        }
+
+        private void OnLanMessageReceived(object? sender, LanMessageReceivedEventArgs e)
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await _chatService.AddIncomingMessageAsync(
+                    e.ThreadId,
+                    e.FromDisplayName,
+                    e.Text,
+                    CancellationToken.None);
+                if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _chatService.MarkThreadAsRead(e.ThreadId);
+                }
+                await ApplySentimentThemeAsync(e.Text);
+                ScheduleSnapshotPush();
+            });
+        }
+
+        private void OnLanFileReceived(object? sender, LanFileReceivedEventArgs e)
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await _chatService.AddIncomingFileMessageAsync(
+                    e.ThreadId,
+                    e.FromDisplayName,
+                    e.FileName,
+                    e.SizeBytes,
+                    e.ScanResult.Status,
+                    CancellationToken.None);
+                if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _chatService.MarkThreadAsRead(e.ThreadId);
+                }
+                ScheduleSnapshotPush();
+                var tone = string.Equals(e.ScanResult.Status, "clean", StringComparison.OrdinalIgnoreCase)
+                    ? "info"
+                    : "error";
+                await SendChatStatusAsync(e.ScanResult.Message, tone);
+            });
+        }
+
+        private async Task StartLanAsync(UserProfile user)
+        {
+            await _lanService.StartAsync(user, CancellationToken.None);
+            _activeThreadId = "all";
+            ScheduleSnapshotPush();
+        }
+
+        private async Task StopLanAsync()
+        {
+            await _lanService.StopAsync();
+            _chatService.Reset();
+        }
+
+        private void ScheduleSnapshotPush()
+        {
+            lock (_snapshotLock)
+            {
+                if (_snapshotScheduled)
+                {
+                    return;
+                }
+                _snapshotScheduled = true;
+            }
+
+            _ = Dispatcher.InvokeAsync(async () =>
+            {
+                await Task.Delay(200);
+                await SendChatPushAsync();
+                lock (_snapshotLock)
+                {
+                    _snapshotScheduled = false;
+                }
+            });
+        }
+
+        private async Task SendChatPushAsync()
+        {
+            if (!_sessionState.IsAuthenticated)
+            {
+                return;
+            }
+
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            var snapshot = await _chatService.GetSnapshotAsync(null, CancellationToken.None);
+            var payload = new
+            {
+                currentUser = snapshot.CurrentUser,
+                contacts = snapshot.Contacts,
+                threads = snapshot.Threads,
+                activeContactId = _activeThreadId
+            };
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "chat.push", true, payload, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+        }
+
+        private Task SendChatStatusAsync(string message, string tone)
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                return Dispatcher.InvokeAsync(() => SendChatStatusAsync(message, tone)).Task;
+            }
+
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var payload = new { message, tone };
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "chat.status", true, payload, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+
+        private async Task HandleDroppedFileAsync(string threadId, string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                await SendChatStatusAsync("Dosya bulunamadi.", "error");
+                return;
+            }
+
+            var info = new FileInfo(filePath);
+            var contentType = GetContentType(info.Extension);
+            var scan = await _fileScanService.ScanAsync(
+                new FileScanRequest(info.Name, info.Length, contentType),
+                CancellationToken.None);
+
+            ChatMessageDto messageDto;
+            try
+            {
+                messageDto = await _chatService.AddFileMessageAsync(
+                    threadId,
+                    info.Name,
+                    info.Length,
+                    scan.Status,
+                    CancellationToken.None);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await SendChatStatusAsync(ex.Message, "error");
+                return;
+            }
+
+            ScheduleSnapshotPush();
+            var tone = string.Equals(scan.Status, "clean", StringComparison.OrdinalIgnoreCase) ? "info" : "error";
+            await SendChatStatusAsync(scan.Message, tone);
+            _ = SendNetworkFileFromPathAsync(threadId, filePath, contentType);
+        }
+
+        private Task SendUiDropAsync()
+        {
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "ui.drop", true, new { action = "hide" }, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+
+        private async Task ApplySentimentThemeAsync(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            try
+            {
+                var result = await _sentimentService.AnalyzeAsync(text, CancellationToken.None);
+                if (result.Tone == _lastTone)
+                {
+                    return;
+                }
+
+                _lastTone = result.Tone;
+                var palette = ThemeFromTone(result.Tone);
+                await SendThemeAsync(palette);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        private Task SendThemeAsync(ThemePalette palette)
+        {
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var payload = new
+            {
+                accent = palette.Accent,
+                accentStrong = palette.AccentStrong,
+                accentSoft = palette.AccentSoft,
+                bubbleMine = palette.BubbleMine
+            };
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "ui.theme", true, payload, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+
+        private static ThemePalette ThemeFromTone(SentimentTone tone)
+        {
+            return tone switch
+            {
+                SentimentTone.Positive => new ThemePalette(
+                    "#2F9C7A",
+                    "#247861",
+                    "rgba(47, 156, 122, 0.25)",
+                    "#1C3F33"),
+                SentimentTone.Negative => new ThemePalette(
+                    "#8A4A4F",
+                    "#6C3A3E",
+                    "rgba(138, 74, 79, 0.2)",
+                    "#3A2628"),
+                _ => new ThemePalette(
+                    "#3C8C7E",
+                    "#2F7267",
+                    "rgba(60, 140, 126, 0.2)",
+                    "#1E3F38")
+            };
+        }
+
+        private async Task SendNetworkMessageAsync(string threadId, string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            try
+            {
+                var result = await _lanService.SendMessageAsync(threadId, text, CancellationToken.None);
+                if (!result.Success)
+                {
+                    await SendChatStatusAsync(result.Message, "error");
+                }
+            }
+            catch (Exception ex)
+            {
+                await SendChatStatusAsync($"Ag gonderimi basarisiz: {ex.Message}", "error");
+            }
+        }
+
+        private async Task SendNetworkFileAsync(string threadId, string fileName, byte[] data, string? contentType)
+        {
+            try
+            {
+                var result = await _lanService.SendFileAsync(threadId, fileName, data, contentType, CancellationToken.None);
+                if (!result.Success)
+                {
+                    await SendChatStatusAsync(result.Message, "error");
+                }
+            }
+            catch (Exception ex)
+            {
+                await SendChatStatusAsync($"Dosya gonderimi basarisiz: {ex.Message}", "error");
+            }
+        }
+
+        private async Task SendNetworkFileFromPathAsync(string threadId, string filePath, string? contentType)
+        {
+            try
+            {
+                var result = await _lanService.SendFileFromPathAsync(threadId, filePath, contentType, CancellationToken.None);
+                if (!result.Success)
+                {
+                    await SendChatStatusAsync(result.Message, "error");
+                }
+            }
+            catch (Exception ex)
+            {
+                await SendChatStatusAsync($"Dosya gonderimi basarisiz: {ex.Message}", "error");
+            }
+        }
+
+        private static string GetContentType(string? extension)
+        {
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                return "application/octet-stream";
+            }
+
+            return extension.ToLowerInvariant() switch
+            {
+                ".png" => "image/png",
+                ".jpg" => "image/jpeg",
+                ".jpeg" => "image/jpeg",
+                ".gif" => "image/gif",
+                ".pdf" => "application/pdf",
+                ".txt" => "text/plain",
+                ".zip" => "application/zip",
+                ".rar" => "application/vnd.rar",
+                ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                _ => "application/octet-stream"
+            };
+        }
+
+        private sealed record ThemePalette(string Accent, string AccentStrong, string AccentSoft, string BubbleMine);
+
+        private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+        {
+            if (!e.Uri.StartsWith($"https://{HostName}/", StringComparison.OrdinalIgnoreCase))
+            {
+                e.Cancel = true;
+            }
+        }
+
+        private void OnContextMenuRequested(object? sender, CoreWebView2ContextMenuRequestedEventArgs e)
+        {
+            e.Handled = true;
+        }
+
+        private void OnWebViewDragOver(object? sender, System.Windows.DragEventArgs e)
+        {
+            if (!_sessionState.IsAuthenticated)
+            {
+                e.Effects = System.Windows.DragDropEffects.None;
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Data.GetDataPresent(System.Windows.DataFormats.FileDrop))
+            {
+                e.Effects = System.Windows.DragDropEffects.Copy;
+            }
+            else
+            {
+                e.Effects = System.Windows.DragDropEffects.None;
+            }
+
+            e.Handled = true;
+        }
+
+        private async void OnWebViewDrop(object? sender, System.Windows.DragEventArgs e)
+        {
+            e.Handled = true;
+            if (!_sessionState.IsAuthenticated)
+            {
+                await SendChatStatusAsync("Oturum bulunamadi.", "error");
+                return;
+            }
+
+            var files = e.Data.GetData(System.Windows.DataFormats.FileDrop) as string[];
+            if (files == null || files.Length == 0)
+            {
+                await SendChatStatusAsync("Dosya bulunamadi.", "error");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_activeThreadId))
+            {
+                await SendChatStatusAsync("Sohbet secmeden dosya gonderemezsin.", "error");
+                return;
+            }
+
+            await HandleDroppedFileAsync(_activeThreadId, files[0]);
+            await SendUiDropAsync();
+        }
+
+        private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            WebMessage? message;
+            try
+            {
+                message = JsonSerializer.Deserialize<WebMessage>(e.WebMessageAsJson, _jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (message == null)
+            {
+                return;
+            }
+
+            switch (message.Type)
+            {
+                case "auth.login":
+                {
+                    var request = DeserializePayload<LoginRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Login verisi okunamadi.");
+                        return;
+                    }
+
+                    var result = await _authService.LoginAsync(request, CancellationToken.None);
+                    await SendResponseAsync(
+                        message,
+                        "auth.result",
+                        result.Success,
+                        new { user = result.User, message = result.Message },
+                        result.Errors);
+                    if (result.Success && result.User != null)
+                    {
+                        await StartLanAsync(result.User);
+                    }
+                    return;
+                }
+                case "auth.register":
+                {
+                    var request = DeserializePayload<RegisterRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Kayit verisi okunamadi.");
+                        return;
+                    }
+
+                    var result = await _authService.RegisterAsync(request, CancellationToken.None);
+                    await SendResponseAsync(
+                        message,
+                        "auth.result",
+                        result.Success,
+                        new { user = result.User, message = result.Message },
+                        result.Errors);
+                    if (result.Success && result.User != null)
+                    {
+                        await StartLanAsync(result.User);
+                    }
+                    return;
+                }
+                case "auth.rename":
+                {
+                    var request = DeserializePayload<RenameRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Kullanici adi verisi okunamadi.");
+                        return;
+                    }
+
+                    var result = await _authService.RenameAsync(request, CancellationToken.None);
+                    await SendResponseAsync(
+                        message,
+                        "auth.rename",
+                        result.Success,
+                        new { user = result.User, message = result.Message },
+                        result.Errors);
+                    if (result.Success && result.User != null)
+                    {
+                        await StartLanAsync(result.User);
+                    }
+                    return;
+                }
+                case "auth.displayName":
+                {
+                    var request = DeserializePayload<DisplayNameRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Gorunen ad verisi okunamadi.");
+                        return;
+                    }
+
+                    var result = await _authService.UpdateDisplayNameAsync(request, CancellationToken.None);
+                    await SendResponseAsync(
+                        message,
+                        "auth.displayName",
+                        result.Success,
+                        new { user = result.User, message = result.Message },
+                        result.Errors);
+                    if (result.Success && result.User != null)
+                    {
+                        await StartLanAsync(result.User);
+                    }
+                    return;
+                }
+                case "auth.logout":
+                {
+                    await StopLanAsync();
+                    _activeThreadId = string.Empty;
+                    var result = await _authService.LogoutAsync(CancellationToken.None);
+                    await SendResponseAsync(
+                        message,
+                        "auth.logout",
+                        result.Success,
+                        new { message = result.Message },
+                        result.Errors);
+                    return;
+                }
+                case "auth.restore":
+                {
+                    var user = await _authService.RestoreSessionAsync(CancellationToken.None);
+                    if (user == null)
+                    {
+                        await SendResponseAsync(
+                            message,
+                            "auth.restore",
+                            false,
+                            new { message = "Oturum bulunamadi." },
+                            null);
+                        return;
+                    }
+
+                    await SendResponseAsync(
+                        message,
+                        "auth.restore",
+                        true,
+                        new { user, message = "Oturum yuklendi." },
+                        null);
+                    await StartLanAsync(user);
+                    return;
+                }
+                case "chat.active":
+                {
+                    var request = DeserializePayload<ChatActiveRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.ThreadId))
+                    {
+                        await SendErrorAsync(message, "Sohbet bilgisi okunamadi.");
+                        return;
+                    }
+
+                    _activeThreadId = request.ThreadId;
+                    _chatService.MarkThreadAsRead(request.ThreadId);
+                    ScheduleSnapshotPush();
+                    await SendResponseAsync(message, "chat.active", true, new { message = "Guncellendi." }, null);
+                    return;
+                }
+                case "chat.snapshot":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var snapshot = await _chatService.GetSnapshotAsync(null, CancellationToken.None);
+                    await SendResponseAsync(message, "chat.snapshot", true, snapshot, null);
+                    return;
+                }
+                case "chat.send":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ChatSendRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Mesaj verisi okunamadi.");
+                        return;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(request.Text))
+                    {
+                        await SendResponseAsync(
+                            message,
+                            "chat.send",
+                            false,
+                            new { message = "Bos mesaj gonderilemez." },
+                            new List<ValidationError> { new("message", "Bos mesaj gonderilemez.") });
+                        return;
+                    }
+
+                    ChatMessageDto messageDto;
+                    try
+                    {
+                        messageDto = await _chatService.AddMessageAsync(
+                            request.ThreadId,
+                            request.Text.Trim(),
+                            CancellationToken.None);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        await SendErrorAsync(message, ex.Message);
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "chat.send", true, new { message = messageDto }, null);
+                    _ = SendNetworkMessageAsync(request.ThreadId, request.Text.Trim());
+                    _ = ApplySentimentThemeAsync(request.Text.Trim());
+                    return;
+                }
+                case "chat.pickFile":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ChatPickFileRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.ThreadId))
+                    {
+                        await SendErrorAsync(message, "Dosya istegi okunamadi.");
+                        return;
+                    }
+
+                    var dialog = new Microsoft.Win32.OpenFileDialog
+                    {
+                        Title = "Dosya Sec",
+                        CheckFileExists = true,
+                        Multiselect = false
+                    };
+
+                    if (dialog.ShowDialog() != true)
+                    {
+                        await SendResponseAsync(
+                            message,
+                            "chat.pickFile",
+                            false,
+                            new { message = "Dosya secilmedi.", cancelled = true },
+                            null);
+                        return;
+                    }
+
+                    var filePath = dialog.FileName;
+                    if (!File.Exists(filePath))
+                    {
+                        await SendErrorAsync(message, "Dosya bulunamadi.");
+                        return;
+                    }
+
+                    var info = new FileInfo(filePath);
+                    var contentType = GetContentType(info.Extension);
+                    var scan = await _fileScanService.ScanAsync(
+                        new FileScanRequest(info.Name, info.Length, contentType),
+                        default);
+
+                    ChatMessageDto messageDto;
+                    try
+                    {
+                        messageDto = await _chatService.AddFileMessageAsync(
+                            request.ThreadId,
+                            info.Name,
+                            info.Length,
+                            scan.Status,
+                            CancellationToken.None);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        await SendErrorAsync(message, ex.Message);
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "chat.pickFile", true, new { message = messageDto, scan }, null);
+                    _ = SendNetworkFileFromPathAsync(request.ThreadId, filePath, contentType);
+                    return;
+                }
+                case "chat.attach":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ChatAttachRequest>(message.Payload);
+                    if (request == null)
+                    {
+                        await SendErrorAsync(message, "Dosya verisi okunamadi.");
+                        return;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(request.DataBase64))
+                    {
+                        await SendErrorAsync(message, "Dosya icerigi bulunamadi.");
+                        return;
+                    }
+
+                    byte[] fileBytes;
+                    try
+                    {
+                        fileBytes = Convert.FromBase64String(request.DataBase64);
+                    }
+                    catch (FormatException)
+                    {
+                        await SendErrorAsync(message, "Dosya verisi bozuk.");
+                        return;
+                    }
+
+                    var actualSize = fileBytes.LongLength;
+                    var scan = await _fileScanService.ScanAsync(
+                        new FileScanRequest(request.FileName, actualSize, request.ContentType),
+                        default);
+
+                    ChatMessageDto messageDto;
+                    try
+                    {
+                        messageDto = await _chatService.AddFileMessageAsync(
+                            request.ThreadId,
+                            request.FileName,
+                            actualSize,
+                            scan.Status,
+                            CancellationToken.None);
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        await SendErrorAsync(message, ex.Message);
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "chat.attach", true, new { message = messageDto, scan }, null);
+                    _ = SendNetworkFileAsync(request.ThreadId, request.FileName, fileBytes, request.ContentType);
+                    return;
+                }
+                default:
+                    await SendErrorAsync(message, "Islem taninmiyor.");
+                    return;
+            }
+        }
+
+        private T? DeserializePayload<T>(JsonElement payload)
+        {
+            if (payload.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                return default;
+            }
+
+            return payload.Deserialize<T>(_jsonOptions);
+        }
+
+        private Task SendErrorAsync(WebMessage message, string error)
+        {
+            var errors = new List<ValidationError> { new("general", error) };
+            return SendResponseAsync(message, message.Type, false, new { message = error }, errors);
+        }
+
+        private Task SendResponseAsync(WebMessage message, string responseType, bool ok, object? payload, IReadOnlyList<ValidationError>? errors)
+        {
+            var response = new WebResponse(message.Id, responseType, ok, payload, errors);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+    }
+}
