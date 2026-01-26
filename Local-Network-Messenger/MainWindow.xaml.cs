@@ -45,6 +45,8 @@ namespace Local_Network_Messenger
         private bool _snapshotScheduled;
         private string _activeThreadId = "all";
         private SentimentTone _lastTone = SentimentTone.Neutral;
+        private bool _uiReady;
+        private (string Message, string Tone, int AutoClearMs)? _pendingUiStatus;
 
         public MainWindow()
         {
@@ -115,6 +117,7 @@ namespace Local_Network_Messenger
                 CoreWebView2HostResourceAccessKind.DenyCors);
 
             MessengerView.CoreWebView2.NavigationStarting += OnNavigationStarting;
+            MessengerView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
             MessengerView.CoreWebView2.ContextMenuRequested += OnContextMenuRequested;
             MessengerView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
             MessengerView.Source = new Uri($"https://{HostName}/index.html");
@@ -123,6 +126,7 @@ namespace Local_Network_Messenger
             MessengerView.Drop += OnWebViewDrop;
 
             InitializeTrayIcon();
+            await EnsureFirewallRulesAsync();
         }
 
         private async Task InitializeUserStoreAsync()
@@ -141,6 +145,24 @@ namespace Local_Network_Messenger
                 _userStore = new InMemoryUserStore();
                 _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore);
             }
+        }
+
+        private async Task EnsureFirewallRulesAsync()
+        {
+            var firewall = new FirewallService();
+            var result = await firewall.EnsureAsync(CancellationToken.None);
+            if (result.Success)
+            {
+                QueueUiStatus("Guvenlik kurallari hazir.", "info", 3500);
+                return;
+            }
+
+            QueueUiStatus(result.Message, "error", 6000);
+            WpfMessageBox.Show(
+                $"Firewall kurallari ayarlanamadi.\n{result.Message}",
+                "Guvenlik",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
         }
 
         private ICryptoBridge CreateCryptoBridge(AppConfig config)
@@ -330,6 +352,20 @@ namespace Local_Network_Messenger
             Activate();
         }
 
+        internal void BringToFrontFromExternal()
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.Invoke(BringToFrontFromExternal);
+                return;
+            }
+
+            ShowFromTray();
+            Topmost = true;
+            Topmost = false;
+            Focus();
+        }
+
         private void ExitApplication()
         {
             _allowClose = true;
@@ -488,6 +524,34 @@ namespace Local_Network_Messenger
             var json = JsonSerializer.Serialize(response, _jsonOptions);
             MessengerView.CoreWebView2.PostWebMessageAsJson(json);
             return Task.CompletedTask;
+        }
+
+        private Task SendUiStatusAsync(string message, string tone, int autoClearMs)
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                return Dispatcher.InvokeAsync(() => SendUiStatusAsync(message, tone, autoClearMs)).Task;
+            }
+
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var payload = new { message, tone, autoClearMs };
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "ui.status", true, payload, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+
+        private void QueueUiStatus(string message, string tone, int autoClearMs)
+        {
+            _pendingUiStatus = (message, tone, autoClearMs);
+            if (_uiReady)
+            {
+                _ = SendUiStatusAsync(message, tone, autoClearMs);
+            }
         }
 
         private async Task HandleDroppedFileAsync(string threadId, string filePath)
@@ -689,6 +753,17 @@ namespace Local_Network_Messenger
             if (!e.Uri.StartsWith($"https://{HostName}/", StringComparison.OrdinalIgnoreCase))
             {
                 e.Cancel = true;
+            }
+        }
+
+        private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            _uiReady = true;
+            if (_pendingUiStatus.HasValue)
+            {
+                var pending = _pendingUiStatus.Value;
+                _pendingUiStatus = null;
+                _ = SendUiStatusAsync(pending.Message, pending.Tone, pending.AutoClearMs);
             }
         }
 

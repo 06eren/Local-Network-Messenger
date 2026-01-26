@@ -68,6 +68,7 @@
     activeContactId: null,
   };
   let dragCounter = 0;
+  let uiStatusTimer = null;
 
   const copy = {
     login: {
@@ -157,6 +158,21 @@
     chatStatusEl.textContent = message;
     chatStatusEl.dataset.tone = tone;
     chatStatusEl.classList.toggle("hidden", message.length === 0);
+  };
+
+  const showUiStatus = (message, tone = "info", autoClearMs = 0) => {
+    setStatus(message, tone);
+    setChatStatus(message, tone);
+    if (uiStatusTimer) {
+      clearTimeout(uiStatusTimer);
+      uiStatusTimer = null;
+    }
+    if (autoClearMs > 0) {
+      uiStatusTimer = setTimeout(() => {
+        setStatus("", "info");
+        setChatStatus("", "info");
+      }, autoClearMs);
+    }
   };
 
   const setAccountStatus = (message, tone = "info") => {
@@ -1053,6 +1069,14 @@
 
       if (data.type === "ui.drop") {
         hideDropOverlay();
+        return;
+      }
+
+      if (data.type === "ui.status" && data.payload) {
+        const message = data.payload.message || "";
+        const tone = data.payload.tone || "info";
+        const autoClearMs = Number(data.payload.autoClearMs || 0);
+        showUiStatus(message, tone, autoClearMs);
         return;
       }
 
