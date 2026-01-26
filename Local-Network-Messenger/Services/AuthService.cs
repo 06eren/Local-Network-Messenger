@@ -11,18 +11,22 @@ namespace Local_Network_Messenger.Services
     public sealed class AuthService
     {
         private static readonly Regex UsernameRegex = new("^[a-zA-Z0-9._-]{3,20}$", RegexOptions.Compiled);
+        private const int MaxFailedAttempts = 5;
+        private static readonly System.TimeSpan LockoutDuration = System.TimeSpan.FromMinutes(10);
 
         private readonly SessionState _session;
         private readonly IUserStore _store;
         private readonly PasswordHasher _hasher;
         private readonly SessionStore _sessionStore;
+        private readonly SecurityEventLogger? _logger;
 
-        public AuthService(SessionState session, IUserStore store, PasswordHasher hasher, SessionStore sessionStore)
+        public AuthService(SessionState session, IUserStore store, PasswordHasher hasher, SessionStore sessionStore, SecurityEventLogger? logger = null)
         {
             _session = session;
             _store = store;
             _hasher = hasher;
             _sessionStore = sessionStore;
+            _logger = logger;
         }
 
         public async Task<AuthResult> LoginAsync(LoginRequest request, CancellationToken cancellationToken)
@@ -50,18 +54,47 @@ namespace Local_Network_Messenger.Services
             if (record == null)
             {
                 errors.Add(new ValidationError("username", "Bu kullanici bulunamadi."));
+                await LogAsync("login.failed", "Kullanici bulunamadi.", username);
                 return new AuthResult(false, null, errors, "Giris yapilamadi.");
+            }
+
+            var security = await _store.GetSecurityInfoAsync(username, cancellationToken);
+            if (security?.LockoutUntil is not null && security.LockoutUntil > System.DateTimeOffset.UtcNow)
+            {
+                var remaining = security.LockoutUntil.Value - System.DateTimeOffset.UtcNow;
+                var minutes = System.Math.Max(1, (int)System.Math.Ceiling(remaining.TotalMinutes));
+                errors.Add(new ValidationError("general", $"Cok fazla hatali giris. {minutes} dk sonra tekrar dene."));
+                await LogAsync("login.locked", "Hesap kilitli.", username);
+                return new AuthResult(false, null, errors, "Hesap gecici olarak kilitli.");
             }
 
             if (!_hasher.Verify(password, record.PasswordHash))
             {
-                errors.Add(new ValidationError("password", "Sifre hatali."));
+                var failed = (security?.FailedCount ?? 0) + 1;
+                System.DateTimeOffset? lockoutUntil = null;
+                if (failed >= MaxFailedAttempts)
+                {
+                    lockoutUntil = System.DateTimeOffset.UtcNow.Add(LockoutDuration);
+                }
+                await _store.UpdateSecurityInfoAsync(username, failed, lockoutUntil, cancellationToken);
+                if (lockoutUntil.HasValue)
+                {
+                    errors.Add(new ValidationError("general", "Cok fazla hatali giris. Hesap gecici olarak kilitlendi."));
+                    await LogAsync("login.locked", "Cok fazla hatali giris.", username);
+                }
+                else
+                {
+                    errors.Add(new ValidationError("password", "Sifre hatali."));
+                    await LogAsync("login.failed", "Sifre hatali.", username);
+                }
                 return new AuthResult(false, null, errors, "Giris yapilamadi.");
             }
 
             var user = new UserProfile(record.Username, record.DisplayName);
             _session.SetUser(user);
             await _sessionStore.SaveAsync(user, cancellationToken);
+            await _store.UpdateSecurityInfoAsync(username, 0, null, cancellationToken);
+            await LogAsync("login.success", "Giris basarili.", username);
             return new AuthResult(true, user, new List<ValidationError>(), "Giris basarili.");
         }
 
@@ -95,9 +128,9 @@ namespace Local_Network_Messenger.Services
             {
                 errors.Add(new ValidationError("password", "Sifreni gir."));
             }
-            else if (password.Length < 8)
+            else
             {
-                errors.Add(new ValidationError("password", "Sifre en az 8 karakter olmali."));
+                errors.AddRange(ValidatePasswordPolicy(password));
             }
 
             if (string.IsNullOrWhiteSpace(confirm))
@@ -122,9 +155,11 @@ namespace Local_Network_Messenger.Services
 
             var hash = _hasher.Hash(password);
             await _store.AddAsync(new UserRecord(username, displayName, hash), cancellationToken);
+            await _store.UpdateSecurityInfoAsync(username, 0, null, cancellationToken);
             var user = new UserProfile(username, displayName);
             _session.SetUser(user);
             await _sessionStore.SaveAsync(user, cancellationToken);
+            await LogAsync("register.success", "Kayit basarili.", username);
             return new AuthResult(true, user, new List<ValidationError>(), "Kayit basarili.");
         }
 
@@ -238,9 +273,63 @@ namespace Local_Network_Messenger.Services
             return new AuthResult(true, null, new List<ValidationError>(), "Cikis yapildi.");
         }
 
+        private static IEnumerable<ValidationError> ValidatePasswordPolicy(string password)
+        {
+            var errors = new List<ValidationError>();
+            if (password.Length < 8 || password.Length > 64)
+            {
+                errors.Add(new ValidationError("password", "Sifre 8-64 karakter olmali."));
+                return errors;
+            }
+
+            var hasUpper = false;
+            var hasLower = false;
+            var hasDigit = false;
+            var hasSpecial = false;
+
+            foreach (var ch in password)
+            {
+                if (char.IsUpper(ch))
+                {
+                    hasUpper = true;
+                }
+                else if (char.IsLower(ch))
+                {
+                    hasLower = true;
+                }
+                else if (char.IsDigit(ch))
+                {
+                    hasDigit = true;
+                }
+                else
+                {
+                    hasSpecial = true;
+                }
+            }
+
+            if (!hasUpper || !hasLower || !hasDigit || !hasSpecial)
+            {
+                errors.Add(new ValidationError(
+                    "password",
+                    "Sifre buyuk harf, kucuk harf, rakam ve ozel karakter icermeli."));
+            }
+
+            return errors;
+        }
+
         private static string Normalize(string? value)
         {
             return (value ?? string.Empty).Trim();
+        }
+
+        private Task LogAsync(string eventType, string message, string? username)
+        {
+            if (_logger == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            return _logger.LogAsync(eventType, message, username);
         }
     }
 }

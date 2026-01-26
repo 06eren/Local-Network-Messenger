@@ -96,7 +96,7 @@ namespace Local_Network_Messenger.Services
                     config = config with
                     {
                         ScanExecutable = pythonPath,
-                        ScanArguments = $"\"{scanScript}\""
+                        ScanArguments = $"-u -X utf8 \"{scanScript}\""
                     };
                 }
             }

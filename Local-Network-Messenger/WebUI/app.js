@@ -50,6 +50,16 @@
   const diagCryptoEl = document.querySelector("[data-diag-crypto]");
   const diagScanEl = document.querySelector("[data-diag-scan]");
   const diagRelayEl = document.querySelector("[data-diag-relay]");
+  const logListEl = document.querySelector("[data-log-list]");
+  const logLimitSelect = document.querySelector("[data-log-limit]");
+  const logRefreshButton = document.querySelector("[data-log-refresh]");
+  const logDownloadButton = document.querySelector("[data-log-download]");
+  const logStatusEl = document.querySelector("[data-log-status]");
+  const archiveRangeSelect = document.querySelector("[data-archive-range]");
+  const archiveExportJsonButton = document.querySelector("[data-archive-export-json]");
+  const archiveExportCsvButton = document.querySelector("[data-archive-export-csv]");
+  const archiveClearButton = document.querySelector("[data-archive-clear]");
+  const archiveStatusEl = document.querySelector("[data-archive-status]");
 
   const inputs = {
     username: document.querySelector("[data-field=\"username\"]"),
@@ -67,9 +77,13 @@
   const chatTitleEl = document.querySelector("[data-chat-title]");
   const chatStatusText = document.querySelector("[data-chat-status]");
   const chatAvatarEl = document.querySelector("[data-chat-avatar]");
+  const connectionQualityEl = document.querySelector("[data-connection-quality]");
   const messagesEl = document.querySelector("[data-messages]");
   const composeInput = document.querySelector("[data-compose]");
   const sendButton = document.querySelector("[data-send]");
+  const messageSearchInput = document.querySelector("[data-message-search]");
+  const messageFilterSelect = document.querySelector("[data-message-filter]");
+  const messageClearButton = document.querySelector("[data-message-clear]");
   const fileInput = document.querySelector("[data-file-input]");
   const filePick = document.querySelector("[data-file-pick]");
   const fileChip = document.querySelector("[data-file-chip]");
@@ -86,6 +100,9 @@
     contacts: [],
     threads: {},
     activeContactId: null,
+    messageQuery: "",
+    messageFilter: "all",
+    forceScroll: false,
   };
   let dragCounter = 0;
   let uiStatusTimer = null;
@@ -237,6 +254,26 @@
     diagStatusEl.classList.toggle("hidden", message.length === 0);
   };
 
+  const setLogStatus = (message, tone = "info") => {
+    if (!logStatusEl) {
+      return;
+    }
+
+    logStatusEl.textContent = message;
+    logStatusEl.dataset.tone = tone;
+    logStatusEl.classList.toggle("hidden", message.length === 0);
+  };
+
+  const setArchiveStatus = (message, tone = "info") => {
+    if (!archiveStatusEl) {
+      return;
+    }
+
+    archiveStatusEl.textContent = message;
+    archiveStatusEl.dataset.tone = tone;
+    archiveStatusEl.classList.toggle("hidden", message.length === 0);
+  };
+
   const loadSettings = () => {
     try {
       const raw = localStorage.getItem("lnm.settings");
@@ -264,6 +301,7 @@
     });
 
     syncTwoFactorMethod();
+    applyUiPreferences(settings);
   };
 
   const collectSettings = () => {
@@ -294,6 +332,39 @@
   const persistSettings = () => {
     const settings = collectSettings();
     localStorage.setItem("lnm.settings", JSON.stringify(settings));
+    applyUiPreferences(settings);
+  };
+
+  const applyUiPreferences = (settings) => {
+    const themeSetting = settings?.theme ?? "Koyu";
+    const densitySetting = settings?.density ?? "Rahat";
+    const fontSetting = settings?.fontSize ?? "Orta";
+
+    const root = document.documentElement;
+    const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+    if (themeSetting === "Acik") {
+      root.dataset.theme = "light";
+    } else if (themeSetting === "Koyu") {
+      root.dataset.theme = "dark";
+    } else {
+      root.dataset.theme = prefersLight ? "light" : "dark";
+    }
+
+    if (densitySetting === "Sik") {
+      root.dataset.density = "compact";
+    } else if (densitySetting === "Rahat") {
+      root.dataset.density = "cozy";
+    } else {
+      root.dataset.density = "normal";
+    }
+
+    let fontSize = "16px";
+    if (fontSetting === "Kucuk") {
+      fontSize = "14px";
+    } else if (fontSetting === "Buyuk") {
+      fontSize = "18px";
+    }
+    root.style.setProperty("--base-font-size", fontSize);
   };
 
   const applyDiagnostics = (snapshot) => {
@@ -363,6 +434,137 @@
     applyDiagnostics(response.payload);
   };
 
+  const formatLogTime = (value) => {
+    if (!value) {
+      return "";
+    }
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return "";
+    }
+    return date.toLocaleString("tr-TR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  };
+
+  const renderLogs = (entries) => {
+    if (!logListEl) {
+      return;
+    }
+
+    if (!entries || entries.length === 0) {
+      logListEl.innerHTML = "<div class=\"empty-state\">Log kaydi bulunamadi.</div>";
+      return;
+    }
+
+    const items = [...entries]
+      .reverse()
+      .map((entry) => {
+        const title = escapeHtml(entry.type || "olay");
+        const user = entry.user ? `@${escapeHtml(entry.user)}` : "Sistem";
+        const message = escapeHtml(entry.message || "");
+        const details = entry.details ? ` · ${escapeHtml(entry.details)}` : "";
+        const time = formatLogTime(entry.at);
+        return `
+          <div class="log-item">
+            <div>
+              <div class="log-title">${title} <span class="log-meta">${user}</span></div>
+              <div class="log-message">${message}${details}</div>
+            </div>
+            <div class="log-meta">${escapeHtml(time)}</div>
+          </div>`;
+      })
+      .join("");
+
+    logListEl.innerHTML = items;
+  };
+
+  const fetchLogs = async () => {
+    if (!hasHost()) {
+      return;
+    }
+
+    setLogStatus("");
+    const limitValue = logLimitSelect?.value ?? "50";
+    const limit = Number.parseInt(limitValue, 10) || 50;
+    const response = await postMessage("logs.security", { limit });
+    if (!response.ok) {
+      setLogStatus(response.payload?.message || "Loglar yuklenemedi.", "error");
+      return;
+    }
+
+    renderLogs(response.payload?.entries || []);
+  };
+
+  const handleLogDownload = async () => {
+    if (!hasHost()) {
+      return;
+    }
+
+    setLogStatus("");
+    const response = await postMessage("logs.download", {});
+    if (!response.ok) {
+      if (response.payload?.cancelled) {
+        setLogStatus(response.payload?.message || "Islem iptal edildi.", "info");
+      } else {
+        setLogStatus(response.payload?.message || "Log indirilemedi.", "error");
+      }
+      return;
+    }
+
+    setLogStatus(response.payload?.message || "Log kaydedildi.");
+  };
+
+  const getArchiveRangeDays = () => {
+    if (!archiveRangeSelect) {
+      return null;
+    }
+    const value = archiveRangeSelect.value;
+    if (value === "all") {
+      return null;
+    }
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  };
+
+  const handleArchiveExport = async (format) => {
+    if (!hasHost()) {
+      return;
+    }
+
+    setArchiveStatus("");
+    const response = await postMessage("archive.export", {
+      format,
+      rangeDays: getArchiveRangeDays(),
+    });
+    if (!response.ok) {
+      if (response.payload?.cancelled) {
+        setArchiveStatus(response.payload?.message || "Islem iptal edildi.", "info");
+      } else {
+        setArchiveStatus(response.payload?.message || "Arsiv kaydedilemedi.", "error");
+      }
+      return;
+    }
+
+    setArchiveStatus(response.payload?.message || "Arsiv kaydedildi.");
+  };
+
+  const handleArchiveClear = async () => {
+    if (!hasHost()) {
+      return;
+    }
+
+    setArchiveStatus("Arsiv temizleniyor...");
+    const response = await postMessage("archive.clear", {
+      rangeDays: getArchiveRangeDays(),
+    });
+    if (!response.ok) {
+      setArchiveStatus(response.payload?.message || "Arsiv temizlenemedi.", "error");
+      return;
+    }
+
+    setArchiveStatus(response.payload?.message || "Arsiv temizlendi.");
+    await loadSnapshot();
+  };
+
   function openSettings() {
     if (!settingsPanel) {
       return;
@@ -375,6 +577,7 @@
     setDiagStatus("");
     applySettings(loadSettings());
     fetchDiagnostics();
+    fetchLogs();
     renameInput?.focus();
   }
 
@@ -388,6 +591,8 @@
     setSettingsStatus("");
     setRelayStatus("");
     setDiagStatus("");
+    setLogStatus("");
+    setArchiveStatus("");
   }
 
   const clearErrors = () => {
@@ -471,6 +676,31 @@
     return `${mb.toFixed(1)} MB`;
   };
 
+  const isNearBottom = (el) => {
+    if (!el) {
+      return true;
+    }
+    const threshold = 80;
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
+  };
+
+  const formatQuality = (contact) => {
+    if (!contact || contact.id === "all") {
+      return "";
+    }
+
+    const ping = Number.isFinite(contact.pingMs) ? Math.round(contact.pingMs) : null;
+    const loss = Number.isFinite(contact.lossPercent) ? Math.round(contact.lossPercent) : null;
+    const parts = [];
+    if (ping !== null) {
+      parts.push(`${ping} ms`);
+    }
+    if (loss !== null) {
+      parts.push(`%${loss} kayip`);
+    }
+    return parts.join(" · ");
+  };
+
   const mapDeliveryState = (state) => {
     switch (state) {
       case "read":
@@ -479,6 +709,8 @@
         return { label: "Ulasti", className: "delivered" };
       case "sent":
         return { label: "Gonderildi", className: "sent" };
+      case "failed":
+        return { label: "Gonderilemedi", className: "failed" };
       default:
         return { label: "", className: "" };
     }
@@ -492,12 +724,15 @@
         return "Aliniyor";
       case "completed":
         return "Tamamlandi";
+      case "failed":
+        return "Basarisiz";
       default:
         return "";
     }
   };
 
   const MAX_FILE_BYTES = 10 * 1024 * 1024;
+  const MAX_MESSAGE_CHARS = 1200;
 
   const readFileAsBase64 = (file) =>
     new Promise((resolve, reject) => {
@@ -518,6 +753,19 @@
       };
       reader.readAsArrayBuffer(file);
     });
+
+  const splitMessage = (text) => {
+    if (text.length <= MAX_MESSAGE_CHARS) {
+      return [text];
+    }
+    const parts = [];
+    let start = 0;
+    while (start < text.length) {
+      parts.push(text.slice(start, start + MAX_MESSAGE_CHARS));
+      start += MAX_MESSAGE_CHARS;
+    }
+    return parts;
+  };
 
   const setComposerEnabled = (enabled) => {
     if (composeInput) {
@@ -646,6 +894,10 @@
         const statusMarkup = statusLabel
           ? `<div class=\"contact-status\">${escapeHtml(statusLabel)}</div>`
           : "";
+        const qualityLabel = formatQuality(contact);
+        const qualityMarkup = qualityLabel
+          ? `<div class=\"contact-quality\">${escapeHtml(qualityLabel)}</div>`
+          : "";
         const dot = contact.id !== "all"
           ? `<span class=\"contact-dot ${contact.isOnline ? "is-online" : ""}\"></span>`
           : "";
@@ -657,6 +909,7 @@
               <div class="contact-name">${name}</div>
               ${previewMarkup}
               ${statusMarkup}
+              ${qualityMarkup}
             </div>
             ${badge}
           </div>`;
@@ -672,12 +925,37 @@
     }
 
     const messages = state.threads[state.activeContactId] || [];
-    if (messages.length === 0) {
-      messagesEl.innerHTML = "<div class=\"empty-state\">Henuz mesaj yok.</div>";
+    const query = state.messageQuery.trim().toLowerCase();
+    const filter = state.messageFilter;
+    const filtered = messages.filter((message) => {
+      if (filter === "files" && !message.attachment) {
+        return false;
+      }
+      if (filter === "text" && message.attachment) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const textMatch = (message.text || "").toLowerCase().includes(query);
+      const fileMatch = message.attachment
+        ? (message.attachment.fileName || "").toLowerCase().includes(query)
+        : false;
+      return textMatch || fileMatch;
+    });
+    if (filtered.length === 0) {
+      const emptyText = query || filter !== "all"
+        ? "Sonuc bulunamadi."
+        : "Henuz mesaj yok.";
+      messagesEl.innerHTML = `<div class=\"empty-state\">${emptyText}</div>`;
+      if (state.forceScroll) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        state.forceScroll = false;
+      }
       return;
     }
 
-    const rows = messages
+    const rows = filtered
       .map((message) => {
         const mineClass = message.isMine ? "message-row mine" : "message-row";
         const text = escapeHtml(message.text);
@@ -699,10 +977,15 @@
           const progressMarkup = progressValue !== null
             ? `<div class=\"attachment-progress\"><span style=\"width:${progressValue}%\"></span></div>`
             : "";
+          const preview = message.attachment.previewDataUrl;
+          const previewMarkup = preview
+            ? `<img class=\"attachment-preview\" src=\"${preview}\" alt=\"${fileName}\" />`
+            : "";
           const metaParts = [size, scanStatus, transferLabel].filter(Boolean).join(" • ");
           const metaMarkup = metaParts ? `<div class=\"attachment-sub\">${metaParts}</div>` : "";
           attachment = `
             <div class=\"attachment\">
+              ${previewMarkup}
               <div class=\"attachment-meta\">
                 <div class=\"attachment-name\">${fileName}</div>
                 ${metaMarkup}
@@ -726,12 +1009,21 @@
       })
       .join("");
 
+    const shouldStick = state.forceScroll || isNearBottom(messagesEl);
+    const previousScrollTop = messagesEl.scrollTop;
     messagesEl.innerHTML = `<div class="message-stack">${rows}</div>`;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (shouldStick) {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else {
+      messagesEl.scrollTop = previousScrollTop;
+    }
+    state.forceScroll = false;
   };
 
   const setActiveContact = (contactId, notify = true) => {
+    const previous = state.activeContactId;
     state.activeContactId = contactId;
+    const changed = previous !== contactId;
     const active = state.contacts.find((contact) => contact.id === contactId);
     if (chatTitleEl) {
       chatTitleEl.textContent = active ? active.displayName : "Secili kisi yok";
@@ -749,6 +1041,17 @@
         chatStatusText.textContent = "Durum bilgisi yok.";
       }
     }
+    if (connectionQualityEl) {
+      if (!active || active.id === "all") {
+        connectionQualityEl.textContent = "";
+        connectionQualityEl.classList.add("hidden");
+      } else {
+        const quality = formatQuality(active);
+        connectionQualityEl.textContent = quality || "Baglanti kalitesi bilinmiyor";
+        connectionQualityEl.classList.remove("hidden");
+        connectionQualityEl.classList.toggle("muted", !quality);
+      }
+    }
     if (typingIndicator) {
       typingIndicator.classList.toggle("hidden", !active || !active.isTyping);
     }
@@ -757,10 +1060,22 @@
       chatAvatarEl.textContent = initials || "LN";
     }
 
+    if (messageSearchInput && state.messageQuery) {
+      messageSearchInput.value = "";
+      state.messageQuery = "";
+    }
+    if (messageFilterSelect && state.messageFilter !== "all") {
+      messageFilterSelect.value = "all";
+      state.messageFilter = "all";
+    }
+
     if (notify) {
       indicateTyping(false);
     }
     setComposerEnabled(Boolean(active));
+    if (changed) {
+      state.forceScroll = true;
+    }
     renderContacts();
     renderMessages();
     if (notify) {
@@ -1013,16 +1328,15 @@
     fetchDiagnostics();
   };
 
-  const handleSend = async () => {
+  const sendSingleMessage = async (text) => {
     if (!state.activeContactId) {
       setChatStatus("Sohbet secmeden mesaj gonderemezsin.", "error");
-      return;
+      return false;
     }
 
-    const text = composeInput?.value.trim() ?? "";
     if (!text) {
       setChatStatus("Mesaj bos olamaz.", "error");
-      return;
+      return false;
     }
 
     const response = await postMessage("chat.send", {
@@ -1032,7 +1346,7 @@
 
     if (!response.ok) {
       setChatStatus(response.payload?.message || "Mesaj gonderilemedi.", "error");
-      return;
+      return false;
     }
 
     const message = response.payload?.message;
@@ -1048,14 +1362,41 @@
       }
     }
 
-    if (composeInput) {
-      composeInput.value = "";
-    }
-
     indicateTyping(false);
+    state.forceScroll = true;
     renderMessages();
     renderContacts();
     setChatStatus("");
+    return true;
+  };
+
+  const handleSend = async () => {
+    if (!state.activeContactId) {
+      setChatStatus("Sohbet secmeden mesaj gonderemezsin.", "error");
+      return;
+    }
+
+    const text = composeInput?.value.trim() ?? "";
+    if (!text) {
+      setChatStatus("Mesaj bos olamaz.", "error");
+      return;
+    }
+
+    const parts = splitMessage(text);
+    if (parts.length > 1) {
+      setChatStatus(`Mesaj ${parts.length} parcaya bolundu.`, "info");
+    }
+
+    for (const part of parts) {
+      const ok = await sendSingleMessage(part);
+      if (!ok) {
+        return;
+      }
+    }
+
+    if (composeInput) {
+      composeInput.value = "";
+    }
   };
 
   const applyFileResponse = (payload) => {
@@ -1079,6 +1420,7 @@
       setChatStatus("Dosya taramaya alindi.");
     }
 
+    state.forceScroll = true;
     renderMessages();
     renderContacts();
   };
@@ -1200,6 +1542,28 @@
     searchInput?.focus();
   });
 
+  messageSearchInput?.addEventListener("input", () => {
+    state.messageQuery = messageSearchInput.value || "";
+    renderMessages();
+  });
+
+  messageFilterSelect?.addEventListener("change", () => {
+    state.messageFilter = messageFilterSelect.value || "all";
+    renderMessages();
+  });
+
+  messageClearButton?.addEventListener("click", () => {
+    if (messageSearchInput) {
+      messageSearchInput.value = "";
+    }
+    if (messageFilterSelect) {
+      messageFilterSelect.value = "all";
+    }
+    state.messageQuery = "";
+    state.messageFilter = "all";
+    renderMessages();
+  });
+
   settingsOpenButton?.addEventListener("click", () => {
     openSettings();
   });
@@ -1255,6 +1619,24 @@
   relaySaveButton?.addEventListener("click", handleRelaySave);
   diagRefreshButton?.addEventListener("click", () => {
     fetchDiagnostics();
+  });
+  logRefreshButton?.addEventListener("click", () => {
+    fetchLogs();
+  });
+  logLimitSelect?.addEventListener("change", () => {
+    fetchLogs();
+  });
+  logDownloadButton?.addEventListener("click", () => {
+    handleLogDownload();
+  });
+  archiveExportJsonButton?.addEventListener("click", () => {
+    handleArchiveExport("json");
+  });
+  archiveExportCsvButton?.addEventListener("click", () => {
+    handleArchiveExport("csv");
+  });
+  archiveClearButton?.addEventListener("click", () => {
+    handleArchiveClear();
   });
 
   sendButton?.addEventListener("click", handleSend);
@@ -1405,6 +1787,16 @@
   setView("auth");
   setComposerEnabled(false);
   syncTwoFactorMethod();
+  applyUiPreferences(loadSettings());
+  if (window.matchMedia) {
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    media.addEventListener("change", () => {
+      const settings = loadSettings();
+      if (settings.theme === "Otomatik") {
+        applyUiPreferences(settings);
+      }
+    });
+  }
   if (hasHost()) {
     restoreSession();
   }

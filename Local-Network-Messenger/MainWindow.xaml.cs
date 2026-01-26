@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -22,6 +23,7 @@ namespace Local_Network_Messenger
     public partial class MainWindow : Window
     {
         private const string HostName = "app.local";
+        private const long MaxPreviewBytes = 512 * 1024;
         private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
         {
             PropertyNameCaseInsensitive = true
@@ -35,11 +37,12 @@ namespace Local_Network_Messenger
         private readonly ICryptoBridge _cryptoBridge;
         private readonly MessageCipher _messageCipher;
         private readonly ChatService _chatService;
+        private IChatArchiveStore _chatArchiveStore;
+        private SecurityEventLogger? _securityLogger;
         private readonly IFileScanService _fileScanService;
         private readonly LanTransportService _lanService;
         private readonly ISentimentService _sentimentService;
         private ProcessJsonClient? _cryptoClient;
-        private ProcessJsonClient? _scanClient;
         private Forms.NotifyIcon? _trayIcon;
         private bool _allowClose;
         private bool _trayHintShown;
@@ -50,6 +53,7 @@ namespace Local_Network_Messenger
         private bool _uiReady;
         private (string Message, string Tone, int AutoClearMs)? _pendingUiStatus;
         private FirewallEnsureResult? _firewallStatus;
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> _deliveryTimers = new();
 
         public MainWindow()
         {
@@ -58,11 +62,13 @@ namespace Local_Network_Messenger
             _hasher = new PasswordHasher();
             _sessionStore = new SessionStore(AppPaths.SessionPath);
             _userStore = new SqliteUserStore(AppPaths.UserDatabasePath);
-            _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore);
+            _securityLogger = new SecurityEventLogger(AppPaths.SecurityLogPath);
+            _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore, _securityLogger);
             _config = AppConfig.Load(AppPaths.ConfigPath);
             _cryptoBridge = CreateCryptoBridge(_config);
             _messageCipher = new MessageCipher(_cryptoBridge, _config.EffectiveCryptoKeyId);
-            _chatService = new ChatService(_sessionState, _messageCipher);
+            _chatArchiveStore = new NoopChatArchiveStore();
+            _chatService = new ChatService(_sessionState, _messageCipher, _chatArchiveStore);
             _fileScanService = CreateFileScanService(_config);
             _lanService = new LanTransportService(
                 _messageCipher,
@@ -79,6 +85,7 @@ namespace Local_Network_Messenger
             _lanService.TypingReceived += OnLanTypingReceived;
             _lanService.FileTransferProgress += OnLanFileTransferProgress;
             _lanService.FileTransferStarted += OnLanFileTransferStarted;
+            _lanService.ConnectionQualityUpdated += OnConnectionQualityUpdated;
             Loaded += OnLoaded;
             Closing += OnClosing;
             Closed += OnClosed;
@@ -97,6 +104,7 @@ namespace Local_Network_Messenger
             }
 
             await InitializeUserStoreAsync();
+            await InitializeArchiveStoreAsync();
 
             try
             {
@@ -151,7 +159,27 @@ namespace Local_Network_Messenger
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
                 _userStore = new InMemoryUserStore();
-                _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore);
+                _authService = new AuthService(_sessionState, _userStore, _hasher, _sessionStore, _securityLogger);
+            }
+        }
+
+        private async Task InitializeArchiveStoreAsync()
+        {
+            try
+            {
+                _chatArchiveStore = new SqliteChatArchiveStore(AppPaths.ChatDatabasePath);
+                await _chatArchiveStore.InitializeAsync(CancellationToken.None);
+                _chatService.SetArchiveStore(_chatArchiveStore);
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(
+                    $"Sohbet arsivi baslatilamadi. Gecici bellek kullanilacak.\n{ex.Message}",
+                    "Arsiv",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                _chatArchiveStore = new NoopChatArchiveStore();
+                _chatService.SetArchiveStore(_chatArchiveStore);
             }
         }
 
@@ -243,13 +271,21 @@ namespace Local_Network_Messenger
 
             try
             {
-                var startInfo = new ProcessStartInfo
+                ProcessJsonClient BuildClient()
                 {
-                    FileName = config.ScanExecutable,
-                    Arguments = config.ScanArguments ?? string.Empty
-                };
-                _scanClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(8));
-                return new FileScanProcessService(_scanClient);
+                    var startInfo = new ProcessStartInfo
+                    {
+                        FileName = config.ScanExecutable!,
+                        Arguments = NormalizePythonScanArguments(config.ScanArguments)
+                    };
+                    startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
+                    startInfo.Environment["PYTHONUTF8"] = "1";
+                    startInfo.Environment["PYTHONUNBUFFERED"] = "1";
+                    return new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(8));
+                }
+
+                var client = BuildClient();
+                return new FileScanProcessService(client, BuildClient);
             }
             catch (Exception ex)
             {
@@ -317,6 +353,7 @@ namespace Local_Network_Messenger
             _lanService.TypingReceived -= OnLanTypingReceived;
             _lanService.FileTransferProgress -= OnLanFileTransferProgress;
             _lanService.FileTransferStarted -= OnLanFileTransferStarted;
+            _lanService.ConnectionQualityUpdated -= OnConnectionQualityUpdated;
             await _lanService.DisposeAsync();
             PythonNetRuntime.Shutdown();
             if (_cryptoBridge is IDisposable disposableBridge)
@@ -331,10 +368,9 @@ namespace Local_Network_Messenger
                 _cryptoClient = null;
             }
 
-            if (_scanClient != null)
+            if (_fileScanService is IAsyncDisposable scanDisposable)
             {
-                await _scanClient.DisposeAsync();
-                _scanClient = null;
+                await scanDisposable.DisposeAsync();
             }
         }
 
@@ -420,6 +456,15 @@ namespace Local_Network_Messenger
             });
         }
 
+        private void OnConnectionQualityUpdated(object? sender, ConnectionQualityEventArgs e)
+        {
+            Dispatcher.InvokeAsync(() =>
+            {
+                _chatService.UpdateConnectionQuality(e.Username, e.PingMs, e.LossPercent);
+                ScheduleSnapshotPush();
+            });
+        }
+
         private void OnLanMessageReceived(object? sender, LanMessageReceivedEventArgs e)
         {
             Dispatcher.InvokeAsync(async () =>
@@ -443,6 +488,10 @@ namespace Local_Network_Messenger
         {
             Dispatcher.InvokeAsync(async () =>
             {
+                var preview = await TryBuildImagePreviewFromFileAsync(
+                    e.FilePath,
+                    e.ContentType,
+                    e.SizeBytes);
                 await _chatService.AddIncomingFileMessageAsync(
                     e.ThreadId,
                     e.FromDisplayName,
@@ -450,7 +499,9 @@ namespace Local_Network_Messenger
                     e.SizeBytes,
                     e.ScanResult.Status,
                     CancellationToken.None,
-                    e.MessageId);
+                    e.MessageId,
+                    e.ContentType,
+                    preview);
                 _chatService.UpdateFileProgress(e.MessageId, 100, "completed");
                 if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
                 {
@@ -469,6 +520,7 @@ namespace Local_Network_Messenger
         {
             Dispatcher.InvokeAsync(() =>
             {
+                ClearDeliveryTimeout(e.MessageId);
                 _chatService.UpdateDeliveryState(e.MessageId, e.Status);
                 ScheduleSnapshotPush();
             });
@@ -658,6 +710,7 @@ namespace Local_Network_Messenger
             var scan = await _fileScanService.ScanAsync(
                 new FileScanRequest(info.Name, info.Length, contentType),
                 CancellationToken.None);
+            var preview = await TryBuildImagePreviewFromFileAsync(filePath, contentType, info.Length);
 
             ChatMessageDto messageDto;
             try
@@ -667,7 +720,10 @@ namespace Local_Network_Messenger
                     info.Name,
                     info.Length,
                     scan.Status,
-                    CancellationToken.None);
+                    CancellationToken.None,
+                    null,
+                    contentType,
+                    preview);
             }
             catch (InvalidOperationException ex)
             {
@@ -692,6 +748,59 @@ namespace Local_Network_Messenger
             var json = JsonSerializer.Serialize(response, _jsonOptions);
             MessengerView.CoreWebView2.PostWebMessageAsJson(json);
             return Task.CompletedTask;
+        }
+
+        private void TrackDeliveryTimeout(string messageId, string threadId)
+        {
+            if (string.IsNullOrWhiteSpace(messageId))
+            {
+                return;
+            }
+
+            if (string.Equals(threadId, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var cts = new CancellationTokenSource();
+            _deliveryTimers.AddOrUpdate(
+                messageId,
+                _ => cts,
+                (_, existing) =>
+                {
+                    existing.Cancel();
+                    existing.Dispose();
+                    return cts;
+                });
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(8), cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                if (cts.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                _chatService.UpdateDeliveryState(messageId, "failed");
+                ScheduleSnapshotPush();
+            });
+        }
+
+        private void ClearDeliveryTimeout(string messageId)
+        {
+            if (_deliveryTimers.TryRemove(messageId, out var cts))
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
         }
 
         private async Task ApplySentimentThemeAsync(string text)
@@ -772,11 +881,17 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendMessageAsync(threadId, text, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    ClearDeliveryTimeout(messageId);
+                    _chatService.UpdateDeliveryState(messageId, "failed");
+                    ScheduleSnapshotPush();
                     await SendChatStatusAsync(result.Message, "error");
                 }
             }
             catch (Exception ex)
             {
+                ClearDeliveryTimeout(messageId);
+                _chatService.UpdateDeliveryState(messageId, "failed");
+                ScheduleSnapshotPush();
                 await SendChatStatusAsync($"Ag gonderimi basarisiz: {ex.Message}", "error");
             }
         }
@@ -788,11 +903,17 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendFileAsync(threadId, fileName, data, contentType, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    _chatService.UpdateFileStatus(messageId, "error");
+                    _chatService.UpdateFileProgress(messageId, 0, "failed");
+                    ScheduleSnapshotPush();
                     await SendChatStatusAsync(result.Message, "error");
                 }
             }
             catch (Exception ex)
             {
+                _chatService.UpdateFileStatus(messageId, "error");
+                _chatService.UpdateFileProgress(messageId, 0, "failed");
+                ScheduleSnapshotPush();
                 await SendChatStatusAsync($"Dosya gonderimi basarisiz: {ex.Message}", "error");
             }
         }
@@ -804,11 +925,17 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendFileFromPathAsync(threadId, filePath, contentType, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    _chatService.UpdateFileStatus(messageId, "error");
+                    _chatService.UpdateFileProgress(messageId, 0, "failed");
+                    ScheduleSnapshotPush();
                     await SendChatStatusAsync(result.Message, "error");
                 }
             }
             catch (Exception ex)
             {
+                _chatService.UpdateFileStatus(messageId, "error");
+                _chatService.UpdateFileProgress(messageId, 0, "failed");
+                ScheduleSnapshotPush();
                 await SendChatStatusAsync($"Dosya gonderimi basarisiz: {ex.Message}", "error");
             }
         }
@@ -837,6 +964,76 @@ namespace Local_Network_Messenger
             };
         }
 
+        private static bool IsImageFile(string fileName, string? contentType)
+        {
+            if (!string.IsNullOrWhiteSpace(contentType) &&
+                contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var ext = Path.GetExtension(fileName).ToLowerInvariant();
+            return ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp";
+        }
+
+        private static string? TryBuildImagePreviewFromBase64(
+            string fileName,
+            string? contentType,
+            long sizeBytes,
+            string base64)
+        {
+            if (!IsImageFile(fileName, contentType))
+            {
+                return null;
+            }
+
+            if (sizeBytes <= 0 || sizeBytes > MaxPreviewBytes)
+            {
+                return null;
+            }
+
+            var type = string.IsNullOrWhiteSpace(contentType)
+                ? GetContentType(Path.GetExtension(fileName))
+                : contentType;
+            return $"data:{type};base64,{base64}";
+        }
+
+        private static async Task<string?> TryBuildImagePreviewFromFileAsync(
+            string filePath,
+            string? contentType,
+            long sizeBytes)
+        {
+            if (!IsImageFile(filePath, contentType))
+            {
+                return null;
+            }
+
+            if (sizeBytes <= 0 || sizeBytes > MaxPreviewBytes)
+            {
+                return null;
+            }
+
+            byte[] bytes;
+            try
+            {
+                bytes = await File.ReadAllBytesAsync(filePath);
+            }
+            catch (IOException)
+            {
+                return null;
+            }
+
+            if (bytes.Length == 0)
+            {
+                return null;
+            }
+
+            var type = string.IsNullOrWhiteSpace(contentType)
+                ? GetContentType(Path.GetExtension(filePath))
+                : contentType;
+            return $"data:{type};base64,{Convert.ToBase64String(bytes)}";
+        }
+
         private static string NormalizeNetworkKey(string? key)
         {
             if (string.IsNullOrWhiteSpace(key))
@@ -847,6 +1044,29 @@ namespace Local_Network_Messenger
             var bytes = Encoding.UTF8.GetBytes(key.Trim());
             var hash = SHA256.HashData(bytes);
             return $"nk-{Convert.ToHexString(hash).ToLowerInvariant()}";
+        }
+
+        private static string NormalizePythonScanArguments(string? args)
+        {
+            var normalized = args ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                var script = Path.Combine(AppContext.BaseDirectory, "Tools", "scan_service.py");
+                if (File.Exists(script))
+                {
+                    return $"-u -X utf8 \"{script}\"";
+                }
+
+                return string.Empty;
+            }
+
+            if (normalized.Contains("-u", StringComparison.OrdinalIgnoreCase) ||
+                normalized.Contains("-X utf8", StringComparison.OrdinalIgnoreCase))
+            {
+                return normalized;
+            }
+
+            return $"-u -X utf8 {normalized}";
         }
 
         private static bool TryParseEndpoint(string value, out string host, out int port)
@@ -939,7 +1159,135 @@ namespace Local_Network_Messenger
             };
         }
 
+        private async Task<IReadOnlyList<SecurityLogEntry>> ReadSecurityLogsAsync(int limit)
+        {
+            if (!File.Exists(AppPaths.SecurityLogPath))
+            {
+                return Array.Empty<SecurityLogEntry>();
+            }
+
+            string[] lines;
+            try
+            {
+                lines = await File.ReadAllLinesAsync(AppPaths.SecurityLogPath);
+            }
+            catch (IOException)
+            {
+                return Array.Empty<SecurityLogEntry>();
+            }
+
+            if (lines.Length == 0)
+            {
+                return Array.Empty<SecurityLogEntry>();
+            }
+
+            var start = Math.Max(0, lines.Length - limit);
+            var entries = new List<SecurityLogEntry>();
+            for (var i = start; i < lines.Length; i += 1)
+            {
+                var line = lines[i];
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var entry = JsonSerializer.Deserialize<SecurityLogEntry>(line, _jsonOptions);
+                    if (entry != null)
+                    {
+                        entries.Add(entry);
+                    }
+                }
+                catch (JsonException)
+                {
+                }
+            }
+
+            return entries;
+        }
+
+        private async Task<List<ArchiveExportEntry>> BuildArchiveExportAsync(
+            IReadOnlyList<ChatArchiveRecord> records,
+            CancellationToken cancellationToken)
+        {
+            var entries = new List<ArchiveExportEntry>(records.Count);
+            foreach (var record in records)
+            {
+                var text = await _messageCipher.DecryptAsync(record.TextCipher, cancellationToken);
+                var fileName = record.AttachmentFileNameCipher == null
+                    ? null
+                    : await _messageCipher.DecryptAsync(record.AttachmentFileNameCipher, cancellationToken);
+                var sentAt = record.SentAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+                entries.Add(new ArchiveExportEntry(
+                    record.ThreadId,
+                    record.Sender,
+                    record.IsMine,
+                    text,
+                    sentAt,
+                    record.DeliveryState,
+                    fileName,
+                    record.AttachmentSizeBytes,
+                    record.AttachmentStatus,
+                    record.AttachmentProgress,
+                    record.AttachmentTransferState));
+            }
+
+            return entries;
+        }
+
+        private static string BuildCsv(IReadOnlyList<ArchiveExportEntry> entries)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("SentAt,ThreadId,Sender,IsMine,Text,DeliveryState,AttachmentFileName,AttachmentSizeBytes,AttachmentStatus,AttachmentProgress,AttachmentTransferState");
+            foreach (var entry in entries)
+            {
+                builder.Append(EscapeCsv(entry.SentAt)).Append(',')
+                    .Append(EscapeCsv(entry.ThreadId)).Append(',')
+                    .Append(EscapeCsv(entry.Sender)).Append(',')
+                    .Append(EscapeCsv(entry.IsMine ? "true" : "false")).Append(',')
+                    .Append(EscapeCsv(entry.Text)).Append(',')
+                    .Append(EscapeCsv(entry.DeliveryState)).Append(',')
+                    .Append(EscapeCsv(entry.AttachmentFileName)).Append(',')
+                    .Append(EscapeCsv(entry.AttachmentSizeBytes?.ToString())).Append(',')
+                    .Append(EscapeCsv(entry.AttachmentStatus)).Append(',')
+                    .Append(EscapeCsv(entry.AttachmentProgress?.ToString("0.##"))).Append(',')
+                    .Append(EscapeCsv(entry.AttachmentTransferState)).AppendLine();
+            }
+
+            return builder.ToString();
+        }
+
+        private static string EscapeCsv(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+
+            var escaped = value.Replace("\"", "\"\"");
+            if (escaped.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0)
+            {
+                return $"\"{escaped}\"";
+            }
+
+            return escaped;
+        }
+
         private sealed record ThemePalette(string Accent, string AccentStrong, string AccentSoft, string BubbleMine);
+        private sealed record SecurityLogEntry(DateTimeOffset At, string Type, string? User, string Message, string? Details);
+        private sealed record ArchiveExportEntry(
+            string ThreadId,
+            string Sender,
+            bool IsMine,
+            string Text,
+            string SentAt,
+            string? DeliveryState,
+            string? AttachmentFileName,
+            long? AttachmentSizeBytes,
+            string? AttachmentStatus,
+            double? AttachmentProgress,
+            string? AttachmentTransferState);
 
         private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
         {
@@ -1049,6 +1397,7 @@ namespace Local_Network_Messenger
                         result.Errors);
                     if (result.Success && result.User != null)
                     {
+                        await _chatService.LoadHistoryAsync(result.User, CancellationToken.None);
                         await StartLanAsync(result.User);
                     }
                     return;
@@ -1071,6 +1420,7 @@ namespace Local_Network_Messenger
                         result.Errors);
                     if (result.Success && result.User != null)
                     {
+                        await _chatService.LoadHistoryAsync(result.User, CancellationToken.None);
                         await StartLanAsync(result.User);
                     }
                     return;
@@ -1152,6 +1502,7 @@ namespace Local_Network_Messenger
                         true,
                         new { user, message = "Oturum yuklendi." },
                         null);
+                    await _chatService.LoadHistoryAsync(user, CancellationToken.None);
                     await StartLanAsync(user);
                     return;
                 }
@@ -1240,6 +1591,7 @@ namespace Local_Network_Messenger
                     }
 
                     await SendResponseAsync(message, "chat.send", true, new { message = messageDto }, null);
+                    TrackDeliveryTimeout(messageDto.Id, request.ThreadId);
                     _ = SendNetworkMessageAsync(request.ThreadId, request.Text.Trim(), messageDto.Id);
                     _ = ApplySentimentThemeAsync(request.Text.Trim());
                     return;
@@ -1335,6 +1687,151 @@ namespace Local_Network_Messenger
                     await SendResponseAsync(message, "diag.snapshot", true, payload, null);
                     return;
                 }
+                case "logs.security":
+                {
+                    var request = DeserializePayload<LogReadRequest>(message.Payload);
+                    var limit = request?.Limit ?? 80;
+                    if (limit < 1)
+                    {
+                        limit = 1;
+                    }
+                    if (limit > 300)
+                    {
+                        limit = 300;
+                    }
+
+                    var entries = await ReadSecurityLogsAsync(limit);
+                    await SendResponseAsync(message, "logs.security", true, new { entries }, null);
+                    return;
+                }
+                case "logs.download":
+                {
+                    if (!File.Exists(AppPaths.SecurityLogPath))
+                    {
+                        await SendErrorAsync(message, "Guvenlik logu bulunamadi.");
+                        return;
+                    }
+
+                    var dialog = new Microsoft.Win32.SaveFileDialog
+                    {
+                        Title = "Guvenlik logunu kaydet",
+                        FileName = $"guvenlik-log-{DateTime.Now:yyyyMMdd-HHmm}.jsonl",
+                        Filter = "Log (JSONL)|*.jsonl|Tum dosyalar|*.*"
+                    };
+
+                    if (dialog.ShowDialog() != true)
+                    {
+                        await SendResponseAsync(
+                            message,
+                            "logs.download",
+                            false,
+                            new { message = "Islem iptal edildi.", cancelled = true },
+                            null);
+                        return;
+                    }
+
+                    File.Copy(AppPaths.SecurityLogPath, dialog.FileName, true);
+                    await SendResponseAsync(message, "logs.download", true, new { message = "Log kaydedildi." }, null);
+                    return;
+                }
+                case "archive.export":
+                {
+                    if (!_sessionState.IsAuthenticated || _sessionState.CurrentUser == null)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ArchiveExportRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.Format))
+                    {
+                        await SendErrorAsync(message, "Arsiv formati okunamadi.");
+                        return;
+                    }
+
+                    var normalized = request.Format.Trim().ToLowerInvariant();
+                    if (normalized is not ("json" or "csv"))
+                    {
+                        await SendErrorAsync(message, "Arsiv formati desteklenmiyor.");
+                        return;
+                    }
+
+                    var rangeDays = request.RangeDays.HasValue && request.RangeDays.Value > 0
+                        ? request.RangeDays.Value
+                        : (int?)null;
+                    var since = rangeDays.HasValue
+                        ? DateTimeOffset.UtcNow.AddDays(-rangeDays.Value)
+                        : (DateTimeOffset?)null;
+
+                    var records = await _chatArchiveStore.LoadRangeAsync(
+                        _sessionState.CurrentUser.Username,
+                        since,
+                        CancellationToken.None);
+
+                    var entries = await BuildArchiveExportAsync(records, CancellationToken.None);
+                    var dialog = new Microsoft.Win32.SaveFileDialog
+                    {
+                        Title = "Sohbet arsivini kaydet",
+                        FileName = $"sohbet-arsivi-{DateTime.Now:yyyyMMdd-HHmm}.{normalized}",
+                        Filter = normalized == "json"
+                            ? "JSON dosyasi|*.json|Tum dosyalar|*.*"
+                            : "CSV dosyasi|*.csv|Tum dosyalar|*.*"
+                    };
+
+                    if (dialog.ShowDialog() != true)
+                    {
+                        await SendResponseAsync(
+                            message,
+                            "archive.export",
+                            false,
+                            new { message = "Islem iptal edildi.", cancelled = true },
+                            null);
+                        return;
+                    }
+
+                    var payloadText = normalized == "json"
+                        ? JsonSerializer.Serialize(entries, new JsonSerializerOptions(JsonSerializerDefaults.Web) { WriteIndented = true })
+                        : BuildCsv(entries);
+                    await File.WriteAllTextAsync(dialog.FileName, payloadText);
+                    await SendResponseAsync(
+                        message,
+                        "archive.export",
+                        true,
+                        new { message = $"Arsiv kaydedildi. ({entries.Count} kayit)" },
+                        null);
+                    return;
+                }
+                case "archive.clear":
+                {
+                    if (!_sessionState.IsAuthenticated || _sessionState.CurrentUser == null)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ArchiveClearRequest>(message.Payload);
+                    var rangeDays = request?.RangeDays.HasValue == true && request.RangeDays.Value > 0
+                        ? request.RangeDays.Value
+                        : (int?)null;
+                    var since = rangeDays.HasValue
+                        ? DateTimeOffset.UtcNow.AddDays(-rangeDays.Value)
+                        : (DateTimeOffset?)null;
+
+                    await _chatArchiveStore.ClearAsync(
+                        _sessionState.CurrentUser.Username,
+                        since,
+                        CancellationToken.None);
+
+                    await _chatService.LoadHistoryAsync(_sessionState.CurrentUser, CancellationToken.None);
+                    ScheduleSnapshotPush();
+                    await SendResponseAsync(
+                        message,
+                        "archive.clear",
+                        true,
+                        new { message = "Arsiv temizlendi." },
+                        null);
+                    return;
+                }
                 case "chat.pickFile":
                 {
                     if (!_sessionState.IsAuthenticated)
@@ -1380,6 +1877,7 @@ namespace Local_Network_Messenger
                     var scan = await _fileScanService.ScanAsync(
                         new FileScanRequest(info.Name, info.Length, contentType),
                         default);
+                    var preview = await TryBuildImagePreviewFromFileAsync(filePath, contentType, info.Length);
 
                     ChatMessageDto messageDto;
                     try
@@ -1389,7 +1887,10 @@ namespace Local_Network_Messenger
                             info.Name,
                             info.Length,
                             scan.Status,
-                            CancellationToken.None);
+                            CancellationToken.None,
+                            null,
+                            contentType,
+                            preview);
                     }
                     catch (InvalidOperationException ex)
                     {
@@ -1437,6 +1938,7 @@ namespace Local_Network_Messenger
                     var scan = await _fileScanService.ScanAsync(
                         new FileScanRequest(request.FileName, actualSize, request.ContentType),
                         default);
+                    var preview = TryBuildImagePreviewFromBase64(request.FileName, request.ContentType, actualSize, request.DataBase64);
 
                     ChatMessageDto messageDto;
                     try
@@ -1446,7 +1948,10 @@ namespace Local_Network_Messenger
                             request.FileName,
                             actualSize,
                             scan.Status,
-                            CancellationToken.None);
+                            CancellationToken.None,
+                            null,
+                            request.ContentType,
+                            preview);
                     }
                     catch (InvalidOperationException ex)
                     {

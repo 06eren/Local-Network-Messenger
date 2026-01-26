@@ -25,6 +25,20 @@ namespace Local_Network_Messenger.Services
 
         public static string ConfigPath => Path.Combine(DataRoot, "config.json");
 
+        public static string ChatDatabasePath => Path.Combine(DataRoot, "chat.db");
+
+        public static string LogsPath
+        {
+            get
+            {
+                var path = Path.Combine(DataRoot, "Logs");
+                Directory.CreateDirectory(path);
+                return path;
+            }
+        }
+
+        public static string SecurityLogPath => Path.Combine(LogsPath, "security.log");
+
         public static string ReceivedFilesPath
         {
             get

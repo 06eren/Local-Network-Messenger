@@ -10,14 +10,18 @@ namespace Local_Network_Messenger.Models
         string Preview,
         bool IsOnline,
         int UnreadCount,
-        bool IsTyping);
+        bool IsTyping,
+        double? PingMs,
+        double? LossPercent);
 
     public sealed record ChatAttachmentDto(
         string FileName,
         long SizeBytes,
         string Status,
         double? Progress,
-        string? TransferState);
+        string? TransferState,
+        string? ContentType,
+        string? PreviewDataUrl);
 
     public sealed record ChatMessageDto(
         string Id,
@@ -44,6 +48,12 @@ namespace Local_Network_Messenger.Models
     public sealed record ChatActiveRequest(string ThreadId);
 
     public sealed record ChatTypingRequest(string ThreadId, bool IsTyping);
+
+    public sealed record ArchiveExportRequest(string Format, int? RangeDays);
+
+    public sealed record ArchiveClearRequest(int? RangeDays);
+
+    public sealed record LogReadRequest(int? Limit);
 
     public sealed record NetworkKeyRequest(string NetworkKey);
 

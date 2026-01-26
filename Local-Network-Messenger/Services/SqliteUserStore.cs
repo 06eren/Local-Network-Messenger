@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
@@ -28,10 +30,41 @@ namespace Local_Network_Messenger.Services
                     DisplayName TEXT NOT NULL,
                     Salt BLOB NOT NULL,
                     Key BLOB NOT NULL,
-                    Iterations INTEGER NOT NULL
+                    Iterations INTEGER NOT NULL,
+                    FailedCount INTEGER NOT NULL DEFAULT 0,
+                    LockoutUntil INTEGER NULL
                 );
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
+            await EnsureSecurityColumnsAsync(connection, cancellationToken);
+        }
+
+        private static async Task EnsureSecurityColumnsAsync(SqliteConnection connection, CancellationToken cancellationToken)
+        {
+            var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            await using (var command = connection.CreateCommand())
+            {
+                command.CommandText = "PRAGMA table_info(Users);";
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    columns.Add(reader.GetString(1));
+                }
+            }
+
+            if (!columns.Contains("FailedCount"))
+            {
+                await using var addFailed = connection.CreateCommand();
+                addFailed.CommandText = "ALTER TABLE Users ADD COLUMN FailedCount INTEGER NOT NULL DEFAULT 0;";
+                await addFailed.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            if (!columns.Contains("LockoutUntil"))
+            {
+                await using var addLockout = connection.CreateCommand();
+                addLockout.CommandText = "ALTER TABLE Users ADD COLUMN LockoutUntil INTEGER NULL;";
+                await addLockout.ExecuteNonQueryAsync(cancellationToken);
+            }
         }
 
         public async Task<bool> ExistsAsync(string username, CancellationToken cancellationToken)
@@ -123,6 +156,50 @@ namespace Local_Network_Messenger.Services
             command.Parameters.AddWithValue("$username", username);
             var rows = await command.ExecuteNonQueryAsync(cancellationToken);
             return rows > 0;
+        }
+
+        public async Task<LoginSecurityInfo?> GetSecurityInfoAsync(string username, CancellationToken cancellationToken)
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT FailedCount, LockoutUntil
+                FROM Users
+                WHERE Username = $username
+                LIMIT 1;
+                """;
+            command.Parameters.AddWithValue("$username", username);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+            {
+                return null;
+            }
+
+            var failed = reader.GetInt32(0);
+            System.DateTimeOffset? lockoutUntil = null;
+            if (!reader.IsDBNull(1))
+            {
+                lockoutUntil = System.DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(1));
+            }
+            return new LoginSecurityInfo(failed, lockoutUntil);
+        }
+
+        public async Task UpdateSecurityInfoAsync(string username, int failedCount, System.DateTimeOffset? lockoutUntil, CancellationToken cancellationToken)
+        {
+            await using var connection = new SqliteConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE Users
+                SET FailedCount = $failedCount,
+                    LockoutUntil = $lockoutUntil
+                WHERE Username = $username;
+                """;
+            command.Parameters.AddWithValue("$failedCount", failedCount);
+            command.Parameters.AddWithValue("$lockoutUntil", lockoutUntil.HasValue ? lockoutUntil.Value.ToUnixTimeMilliseconds() : DBNull.Value);
+            command.Parameters.AddWithValue("$username", username);
+            await command.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 }

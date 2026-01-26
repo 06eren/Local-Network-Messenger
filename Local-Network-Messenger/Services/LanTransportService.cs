@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -58,6 +59,7 @@ namespace Local_Network_Messenger.Services
             string fileName,
             string filePath,
             long sizeBytes,
+            string? contentType,
             FileScanResult scanResult)
         {
             From = from;
@@ -67,6 +69,7 @@ namespace Local_Network_Messenger.Services
             FileName = fileName;
             FilePath = filePath;
             SizeBytes = sizeBytes;
+            ContentType = contentType;
             ScanResult = scanResult;
         }
 
@@ -77,6 +80,7 @@ namespace Local_Network_Messenger.Services
         public string FileName { get; }
         public string FilePath { get; }
         public long SizeBytes { get; }
+        public string? ContentType { get; }
         public FileScanResult ScanResult { get; }
     }
 
@@ -160,12 +164,29 @@ namespace Local_Network_Messenger.Services
         public long SizeBytes { get; }
     }
 
+    public sealed class ConnectionQualityEventArgs : EventArgs
+    {
+        public ConnectionQualityEventArgs(string username, double? pingMs, double? lossPercent)
+        {
+            Username = username;
+            PingMs = pingMs;
+            LossPercent = lossPercent;
+        }
+
+        public string Username { get; }
+        public double? PingMs { get; }
+        public double? LossPercent { get; }
+    }
+
     public sealed class LanTransportService : IAsyncDisposable
     {
-        private const int ChunkSize = 64 * 1024;
+        private const int ChunkSize = 32 * 1024;
         private static readonly TimeSpan PresenceInterval = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan PresenceTimeout = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan PingInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan PingTimeout = TimeSpan.FromSeconds(8);
+        private const int PingWindowSize = 12;
         private readonly MessageCipher _cipher;
         private readonly IFileScanService _scanService;
         private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
@@ -176,6 +197,7 @@ namespace Local_Network_Messenger.Services
         private readonly ConcurrentDictionary<string, FileReceiveSession> _incomingFiles = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, bool> _manualPeers = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, RelayClientSession> _relaySessions = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, PingTracker> _pingTrackers = new(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _relayWriteLock = new(1, 1);
         private readonly string _instanceId = Guid.NewGuid().ToString("N");
         private readonly int _discoveryPort;
@@ -189,6 +211,7 @@ namespace Local_Network_Messenger.Services
         private Task? _udpReceiveTask;
         private Task? _announceTask;
         private Task? _cleanupTask;
+        private Task? _pingTask;
         private Task? _acceptTask;
         private Task? _relayAcceptTask;
         private Task? _relayReceiveTask;
@@ -219,6 +242,7 @@ namespace Local_Network_Messenger.Services
         public event EventHandler<LanTypingReceivedEventArgs>? TypingReceived;
         public event EventHandler<FileTransferProgressEventArgs>? FileTransferProgress;
         public event EventHandler<FileTransferStartedEventArgs>? FileTransferStarted;
+        public event EventHandler<ConnectionQualityEventArgs>? ConnectionQualityUpdated;
 
         public int ListenPort => _listenPort;
 
@@ -249,6 +273,7 @@ namespace Local_Network_Messenger.Services
             _udpReceiveTask = Task.Run(() => ReceivePresenceLoopAsync(token), token);
             _announceTask = Task.Run(() => AnnounceLoopAsync(token), token);
             _cleanupTask = Task.Run(() => CleanupLoopAsync(token), token);
+            _pingTask = Task.Run(() => PingLoopAsync(token), token);
             _acceptTask = Task.Run(() => AcceptLoopAsync(token), token);
             await BroadcastPresenceAsync(cancellationToken);
         }
@@ -264,7 +289,7 @@ namespace Local_Network_Messenger.Services
             _udpClient?.Dispose();
             _listener?.Stop();
 
-            var tasks = new[] { _udpReceiveTask, _announceTask, _cleanupTask, _acceptTask };
+            var tasks = new[] { _udpReceiveTask, _announceTask, _cleanupTask, _pingTask, _acceptTask };
             foreach (var task in tasks)
             {
                 if (task == null)
@@ -286,12 +311,14 @@ namespace Local_Network_Messenger.Services
             _udpReceiveTask = null;
             _announceTask = null;
             _cleanupTask = null;
+            _pingTask = null;
             _acceptTask = null;
             _udpClient = null;
             _listener = null;
             _peers.Clear();
             _incomingFiles.Clear();
             _manualPeers.Clear();
+            _pingTrackers.Clear();
 
             await StopRelayClientAsync();
             await StopRelayServerAsync();
@@ -952,6 +979,12 @@ namespace Local_Network_Messenger.Services
                 case LanPacketTypes.FileChunk:
                     await HandleFileChunkAsync(packet.Payload, cancellationToken);
                     break;
+                case LanPacketTypes.NetPing:
+                    await HandlePingAsync(packet.Payload, null, true, cancellationToken);
+                    break;
+                case LanPacketTypes.NetPong:
+                    await HandlePongAsync(packet.Payload, cancellationToken);
+                    break;
                 default:
                     break;
             }
@@ -1230,9 +1263,20 @@ namespace Local_Network_Messenger.Services
                     var updated = peer with { IsOnline = false };
                     _peers[entry.Key] = updated;
                     PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
+                    ClearPingState(entry.Key);
                 }
 
                 await Task.Delay(CleanupInterval, cancellationToken);
+            }
+        }
+
+        private async Task PingLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await SendPingBatchAsync(cancellationToken);
+                CleanupPingTimeouts();
+                await Task.Delay(PingInterval, cancellationToken);
             }
         }
 
@@ -1336,6 +1380,12 @@ namespace Local_Network_Messenger.Services
                         break;
                     case LanPacketTypes.FileChunk:
                         await HandleFileChunkAsync(packet.Payload, cancellationToken);
+                        break;
+                    case LanPacketTypes.NetPing:
+                        await HandlePingAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
+                        break;
+                    case LanPacketTypes.NetPong:
+                        await HandlePongAsync(packet.Payload, cancellationToken);
                         break;
                     default:
                         break;
@@ -1460,6 +1510,99 @@ namespace Local_Network_Messenger.Services
             }
 
             TypingReceived?.Invoke(this, new LanTypingReceivedEventArgs(typing.ThreadId, typing.From, typing.IsTyping));
+            await Task.CompletedTask;
+        }
+
+        private async Task HandlePingAsync(
+            JsonElement payload,
+            IPEndPoint? remoteEndPoint,
+            bool viaRelay,
+            CancellationToken cancellationToken)
+        {
+            LanPing? ping;
+            try
+            {
+                ping = payload.Deserialize<LanPing>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (ping == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(ping.To))
+            {
+                return;
+            }
+
+            if (!viaRelay)
+            {
+                UpsertPeer(ping.From, ping.FromDisplayName, remoteEndPoint, ping.ListenPort, "local");
+            }
+            else
+            {
+                UpsertPeer(ping.From, ping.FromDisplayName, _relayServerEndPoint, ping.ListenPort, "relay");
+            }
+
+            if (_user == null)
+            {
+                return;
+            }
+
+            var pong = new LanPong(ping.PingId, _user.Username, _user.DisplayName, ping.From, _listenPort);
+            if (viaRelay)
+            {
+                await SendRelayPacketAsync(LanPacketTypes.NetPong, ping.From, pong, cancellationToken);
+                return;
+            }
+
+            if (remoteEndPoint == null)
+            {
+                return;
+            }
+
+            var port = ping.ListenPort > 0 ? ping.ListenPort : remoteEndPoint.Port;
+            var endPoint = new IPEndPoint(remoteEndPoint.Address, port);
+            await SendPacketAsync(endPoint, LanPacketTypes.NetPong, pong, cancellationToken);
+        }
+
+        private async Task HandlePongAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanPong? pong;
+            try
+            {
+                pong = payload.Deserialize<LanPong>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (pong == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(pong.To))
+            {
+                return;
+            }
+
+            if (!_pingTrackers.TryGetValue(pong.From, out var tracker))
+            {
+                tracker = new PingTracker();
+                _pingTrackers[pong.From] = tracker;
+            }
+
+            if (tracker.TryComplete(pong.PingId, out var latencyMs))
+            {
+                RecordPingOutcome(pong.From, latencyMs, success: true);
+            }
+
             await Task.CompletedTask;
         }
 
@@ -1686,6 +1829,7 @@ namespace Local_Network_Messenger.Services
                         session.FileName,
                         session.FilePath,
                         session.Start.SizeBytes,
+                        session.Start.ContentType,
                         scan));
             }
         }
@@ -1728,6 +1872,7 @@ namespace Local_Network_Messenger.Services
                     session.FileName,
                     session.FilePath,
                     session.Start.SizeBytes,
+                    session.Start.ContentType,
                     result));
         }
 
@@ -2003,6 +2148,7 @@ namespace Local_Network_Messenger.Services
                 var updated = peer with { IsOnline = false, LastSeen = now };
                 _peers[entry.Key] = updated;
                 PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
+                ClearPingState(entry.Key);
             }
         }
 
@@ -2026,6 +2172,135 @@ namespace Local_Network_Messenger.Services
             var updated = peer with { IsOnline = false, LastSeen = lastSeen };
             _peers[username] = updated;
             PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
+            ClearPingState(username);
+        }
+
+        private void ClearPingState(string username)
+        {
+            if (_pingTrackers.TryRemove(username, out _))
+            {
+                ConnectionQualityUpdated?.Invoke(this, new ConnectionQualityEventArgs(username, null, null));
+            }
+        }
+
+        private async Task SendPingBatchAsync(CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            foreach (var peer in _peers.Values)
+            {
+                if (!peer.IsOnline)
+                {
+                    continue;
+                }
+
+                if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase) && !_relayConnected)
+                {
+                    continue;
+                }
+
+                await SendPingToPeerAsync(peer, cancellationToken);
+            }
+        }
+
+        private async Task SendPingToPeerAsync(PeerInfo peer, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            var pingId = Guid.NewGuid().ToString("N");
+            var tracker = _pingTrackers.GetOrAdd(peer.Username, _ => new PingTracker());
+            tracker.TrackPending(pingId);
+
+            var payload = new LanPing(pingId, _user.Username, _user.DisplayName, peer.Username, _listenPort);
+            try
+            {
+                if (ShouldUseRelay(peer.Username, peer))
+                {
+                    await SendRelayPacketAsync(LanPacketTypes.NetPing, peer.Username, payload, cancellationToken);
+                    return;
+                }
+
+                await SendPacketAsync(peer.EndPoint, LanPacketTypes.NetPing, payload, cancellationToken);
+            }
+            catch (SocketException)
+            {
+                RecordPingOutcome(peer.Username, null, false);
+            }
+            catch (IOException)
+            {
+                RecordPingOutcome(peer.Username, null, false);
+            }
+        }
+
+        private void CleanupPingTimeouts()
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var entry in _pingTrackers)
+            {
+                foreach (var pending in entry.Value.Pending)
+                {
+                    if (now - pending.Value < PingTimeout)
+                    {
+                        continue;
+                    }
+
+                    if (entry.Value.Pending.TryRemove(pending.Key, out _))
+                    {
+                        RecordPingOutcome(entry.Key, null, false);
+                    }
+                }
+            }
+        }
+
+        private void RecordPingOutcome(string username, double? latencyMs, bool success)
+        {
+            if (!_pingTrackers.TryGetValue(username, out var tracker))
+            {
+                return;
+            }
+
+            double? pingMs;
+            double? lossPercent;
+            lock (tracker.Sync)
+            {
+                if (tracker.Outcomes.Count >= PingWindowSize)
+                {
+                    tracker.Outcomes.Dequeue();
+                }
+
+                tracker.Outcomes.Enqueue(new PingOutcome(success, latencyMs));
+                if (success && latencyMs.HasValue)
+                {
+                    tracker.LastRttMs = latencyMs.Value;
+                }
+
+                pingMs = tracker.LastRttMs.HasValue ? Math.Round(tracker.LastRttMs.Value, 1) : null;
+                if (tracker.Outcomes.Count == 0)
+                {
+                    lossPercent = null;
+                }
+                else
+                {
+                    var failures = 0;
+                    foreach (var outcome in tracker.Outcomes)
+                    {
+                        if (!outcome.Success)
+                        {
+                            failures += 1;
+                        }
+                    }
+
+                    lossPercent = Math.Round(failures * 100d / tracker.Outcomes.Count, 1);
+                }
+            }
+
+            ConnectionQualityUpdated?.Invoke(this, new ConnectionQualityEventArgs(username, pingMs, lossPercent));
         }
 
         private async Task SendPacketAsync(IPEndPoint endPoint, string type, object payload, CancellationToken cancellationToken)
@@ -2296,6 +2571,33 @@ namespace Local_Network_Messenger.Services
             }
             return string.IsNullOrWhiteSpace(safe) ? "dosya.bin" : safe;
         }
+
+        private sealed class PingTracker
+        {
+            public ConcurrentDictionary<string, DateTimeOffset> Pending { get; } = new();
+            public Queue<PingOutcome> Outcomes { get; } = new();
+            public object Sync { get; } = new();
+            public double? LastRttMs { get; set; }
+
+            public void TrackPending(string pingId)
+            {
+                Pending[pingId] = DateTimeOffset.UtcNow;
+            }
+
+            public bool TryComplete(string pingId, out double latencyMs)
+            {
+                if (Pending.TryRemove(pingId, out var sentAt))
+                {
+                    latencyMs = (DateTimeOffset.UtcNow - sentAt).TotalMilliseconds;
+                    return true;
+                }
+
+                latencyMs = 0;
+                return false;
+            }
+        }
+
+        private sealed record PingOutcome(bool Success, double? LatencyMs);
 
         private sealed class RelayClientSession
         {

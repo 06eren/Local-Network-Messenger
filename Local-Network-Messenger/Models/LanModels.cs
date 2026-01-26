@@ -13,6 +13,8 @@ namespace Local_Network_Messenger.Models
         public const string PeerOffline = "peer.offline";
         public const string FileStart = "chat.file.start";
         public const string FileChunk = "chat.file.chunk";
+        public const string NetPing = "net.ping";
+        public const string NetPong = "net.pong";
     }
 
     public static class RelayPacketTypes
@@ -82,4 +84,18 @@ namespace Local_Network_Messenger.Models
         int Index,
         string DataCipher,
         bool IsLast);
+
+    public sealed record LanPing(
+        string PingId,
+        string From,
+        string FromDisplayName,
+        string To,
+        int ListenPort);
+
+    public sealed record LanPong(
+        string PingId,
+        string From,
+        string FromDisplayName,
+        string To,
+        int ListenPort);
 }

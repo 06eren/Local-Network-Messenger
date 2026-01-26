@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 namespace Local_Network_Messenger.Services
 {
     public sealed record UserRecord(string Username, string DisplayName, PasswordHash PasswordHash);
+    public sealed record LoginSecurityInfo(int FailedCount, System.DateTimeOffset? LockoutUntil);
 
     public interface IUserStore
     {
@@ -19,11 +20,16 @@ namespace Local_Network_Messenger.Services
         Task<bool> RenameAsync(string currentUsername, string newUsername, CancellationToken cancellationToken);
 
         Task<bool> UpdateDisplayNameAsync(string username, string displayName, CancellationToken cancellationToken);
+
+        Task<LoginSecurityInfo?> GetSecurityInfoAsync(string username, CancellationToken cancellationToken);
+
+        Task UpdateSecurityInfoAsync(string username, int failedCount, System.DateTimeOffset? lockoutUntil, CancellationToken cancellationToken);
     }
 
     public sealed class InMemoryUserStore : IUserStore
     {
         private readonly Dictionary<string, UserRecord> _users = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, LoginSecurityInfo> _security = new(StringComparer.OrdinalIgnoreCase);
 
         public Task InitializeAsync(CancellationToken cancellationToken)
         {
@@ -44,6 +50,7 @@ namespace Local_Network_Messenger.Services
         public Task AddAsync(UserRecord record, CancellationToken cancellationToken)
         {
             _users[record.Username] = record;
+            _security[record.Username] = new LoginSecurityInfo(0, null);
             return Task.CompletedTask;
         }
 
@@ -73,6 +80,21 @@ namespace Local_Network_Messenger.Services
 
             _users[username] = record with { DisplayName = displayName };
             return Task.FromResult(true);
+        }
+
+        public Task<LoginSecurityInfo?> GetSecurityInfoAsync(string username, CancellationToken cancellationToken)
+        {
+            _security.TryGetValue(username, out var info);
+            return Task.FromResult<LoginSecurityInfo?>(info);
+        }
+
+        public Task UpdateSecurityInfoAsync(string username, int failedCount, System.DateTimeOffset? lockoutUntil, CancellationToken cancellationToken)
+        {
+            if (_security.ContainsKey(username))
+            {
+                _security[username] = new LoginSecurityInfo(failedCount, lockoutUntil);
+            }
+            return Task.CompletedTask;
         }
     }
 }

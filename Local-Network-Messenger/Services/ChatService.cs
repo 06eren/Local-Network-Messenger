@@ -12,16 +12,77 @@ namespace Local_Network_Messenger.Services
         private const string NetworkThreadId = "all";
         private readonly SessionState _session;
         private readonly MessageCipher _cipher;
+        private IChatArchiveStore _archive;
         private readonly Dictionary<string, Contact> _contacts = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<ChatMessage>> _threads = new();
 
         public event EventHandler<ChatNotification>? MessageReceived;
 
-        public ChatService(SessionState session, MessageCipher cipher)
+        public ChatService(SessionState session, MessageCipher cipher, IChatArchiveStore? archive = null)
         {
             _session = session;
             _cipher = cipher;
+            _archive = archive ?? new NoopChatArchiveStore();
             Seed();
+        }
+
+        public void SetArchiveStore(IChatArchiveStore archive)
+        {
+            _archive = archive ?? new NoopChatArchiveStore();
+        }
+
+        public async Task LoadHistoryAsync(UserProfile user, CancellationToken cancellationToken)
+        {
+            _contacts.Clear();
+            _threads.Clear();
+            Seed();
+
+            var records = await _archive.LoadRecentAsync(user.Username, 2000, cancellationToken);
+            foreach (var record in records)
+            {
+                var attachment = record.AttachmentFileNameCipher == null
+                    ? null
+                    : new ChatAttachment(
+                        record.AttachmentFileNameCipher,
+                        record.AttachmentSizeBytes ?? 0,
+                        record.AttachmentStatus ?? string.Empty,
+                        record.AttachmentProgress,
+                        record.AttachmentTransferState,
+                        null,
+                        null);
+                var message = new ChatMessage(
+                    record.Id,
+                    record.ThreadId,
+                    record.Sender,
+                    record.IsMine,
+                    record.TextCipher,
+                    record.SentAt,
+                    attachment,
+                    record.DeliveryState);
+
+                if (!_threads.TryGetValue(record.ThreadId, out var list))
+                {
+                    list = new List<ChatMessage>();
+                    _threads[record.ThreadId] = list;
+                }
+
+                list.Add(message);
+
+                if (record.ThreadId == NetworkThreadId)
+                {
+                    var general = FindContact(NetworkThreadId);
+                    general.PreviewCipher = record.TextCipher;
+                    general.LastSeenAt = record.SentAt;
+                    continue;
+                }
+
+                var displayName = record.IsMine ? record.ThreadId : record.Sender;
+                var contact = EnsureContact(record.ThreadId, displayName);
+                contact.IsOnline = false;
+                contact.PreviewCipher = record.TextCipher;
+                contact.LastSeenAt = record.SentAt;
+                contact.UnreadCount = 0;
+            }
         }
 
         public async Task<ChatSnapshot> GetSnapshotAsync(string? activeContactId, CancellationToken cancellationToken)
@@ -80,6 +141,7 @@ namespace Local_Network_Messenger.Services
             contact.IsOnline = true;
             contact.LastSeenAt = DateTimeOffset.UtcNow;
             contact.IsTyping = false;
+            await PersistAsync(message, cancellationToken);
             return await MapMessageAsync(message, cancellationToken);
         }
 
@@ -89,7 +151,9 @@ namespace Local_Network_Messenger.Services
             long sizeBytes,
             string status,
             CancellationToken cancellationToken,
-            string? messageId = null)
+            string? messageId = null,
+            string? contentType = null,
+            string? previewDataUrl = null)
         {
             var user = RequireUser();
             var contact = FindContact(threadId);
@@ -102,7 +166,7 @@ namespace Local_Network_Messenger.Services
             var text = "Dosya paylasildi";
             var textCipher = await _cipher.EncryptAsync(text, cancellationToken);
             var fileCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
-            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress");
+            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl);
             var message = new ChatMessage(
                 string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("N") : messageId!,
                 threadId,
@@ -119,6 +183,7 @@ namespace Local_Network_Messenger.Services
             contact.IsOnline = true;
             contact.LastSeenAt = DateTimeOffset.UtcNow;
             contact.IsTyping = false;
+            await PersistAsync(message, cancellationToken);
             return await MapMessageAsync(message, cancellationToken);
         }
 
@@ -152,6 +217,7 @@ namespace Local_Network_Messenger.Services
             contact.IsOnline = true;
             contact.LastSeenAt = DateTimeOffset.UtcNow;
             contact.IsTyping = false;
+            await PersistAsync(message, cancellationToken);
             var dto = await MapMessageAsync(message, cancellationToken);
             MessageReceived?.Invoke(this, new ChatNotification(threadId, contact.DisplayName, sender, dto.Text));
             return dto;
@@ -164,7 +230,9 @@ namespace Local_Network_Messenger.Services
             long sizeBytes,
             string status,
             CancellationToken cancellationToken,
-            string? messageId = null)
+            string? messageId = null,
+            string? contentType = null,
+            string? previewDataUrl = null)
         {
             var contact = EnsureContact(threadId, sender);
             if (!_threads.TryGetValue(threadId, out var list))
@@ -181,11 +249,20 @@ namespace Local_Network_Messenger.Services
                     if (existing.Attachment != null)
                     {
                         existing.Attachment.Status = status;
+                        if (!string.IsNullOrWhiteSpace(contentType))
+                        {
+                            existing.Attachment.ContentType = contentType;
+                        }
+                        if (!string.IsNullOrWhiteSpace(previewDataUrl))
+                        {
+                            existing.Attachment.PreviewDataUrl = previewDataUrl;
+                        }
                     }
                     contact.PreviewCipher = existing.TextCipher;
                     contact.IsOnline = true;
                     contact.LastSeenAt = DateTimeOffset.UtcNow;
                     contact.IsTyping = false;
+                    await PersistAsync(existing, cancellationToken);
                     return await MapMessageAsync(existing, cancellationToken);
                 }
             }
@@ -193,7 +270,7 @@ namespace Local_Network_Messenger.Services
             var text = "Dosya paylasildi";
             var textCipher = await _cipher.EncryptAsync(text, cancellationToken);
             var fileCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
-            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress");
+            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl);
             var message = new ChatMessage(
                 string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("N") : messageId!,
                 threadId,
@@ -210,6 +287,7 @@ namespace Local_Network_Messenger.Services
             contact.IsOnline = true;
             contact.LastSeenAt = DateTimeOffset.UtcNow;
             contact.IsTyping = false;
+            await PersistAsync(message, cancellationToken);
             var dto = await MapMessageAsync(message, cancellationToken);
             MessageReceived?.Invoke(this, new ChatNotification(threadId, contact.DisplayName, sender, dto.Text));
             return dto;
@@ -224,7 +302,7 @@ namespace Local_Network_Messenger.Services
 
             if (!_contacts.TryGetValue(contactId, out var contact))
             {
-                contact = new Contact(contactId, displayName, isOnline, lastSeenAt, string.Empty, false);
+                contact = new Contact(contactId, displayName, isOnline, lastSeenAt, string.Empty, false, null, null);
                 _contacts[contactId] = contact;
                 return;
             }
@@ -234,6 +312,8 @@ namespace Local_Network_Messenger.Services
             if (!isOnline)
             {
                 contact.IsTyping = false;
+                contact.PingMs = null;
+                contact.LossPercent = null;
             }
             if (lastSeenAt.HasValue)
             {
@@ -250,6 +330,8 @@ namespace Local_Network_Messenger.Services
 
             contact.IsOnline = false;
             contact.IsTyping = false;
+            contact.PingMs = null;
+            contact.LossPercent = null;
             if (lastSeenAt.HasValue)
             {
                 contact.LastSeenAt = lastSeenAt;
@@ -305,6 +387,8 @@ namespace Local_Network_Messenger.Services
                 message.DeliveryState = state;
                 break;
             }
+
+            _ = _archive.UpdateDeliveryStateAsync(_session.CurrentUser?.Username ?? string.Empty, messageId, state, CancellationToken.None);
         }
 
         public void UpdateTypingStatus(string contactId, bool isTyping)
@@ -315,6 +399,17 @@ namespace Local_Network_Messenger.Services
             }
 
             contact.IsTyping = isTyping;
+        }
+
+        public void UpdateConnectionQuality(string contactId, double? pingMs, double? lossPercent)
+        {
+            if (!_contacts.TryGetValue(contactId, out var contact))
+            {
+                return;
+            }
+
+            contact.PingMs = pingMs;
+            contact.LossPercent = lossPercent;
         }
 
         public void UpdateFileProgress(string messageId, double progress, string? transferState)
@@ -343,6 +438,14 @@ namespace Local_Network_Messenger.Services
                 }
                 break;
             }
+
+            _ = _archive.UpdateAttachmentAsync(
+                _session.CurrentUser?.Username ?? string.Empty,
+                messageId,
+                null,
+                progress,
+                transferState,
+                CancellationToken.None);
         }
 
         public void UpdateFileStatus(string messageId, string status)
@@ -363,6 +466,14 @@ namespace Local_Network_Messenger.Services
                 message.Attachment.Status = status;
                 break;
             }
+
+            _ = _archive.UpdateAttachmentAsync(
+                _session.CurrentUser?.Username ?? string.Empty,
+                messageId,
+                status,
+                null,
+                null,
+                CancellationToken.None);
         }
 
         public void Reset()
@@ -370,6 +481,31 @@ namespace Local_Network_Messenger.Services
             _contacts.Clear();
             _threads.Clear();
             Seed();
+        }
+
+        private Task PersistAsync(ChatMessage message, CancellationToken cancellationToken)
+        {
+            var owner = _session.CurrentUser?.Username;
+            if (string.IsNullOrWhiteSpace(owner))
+            {
+                return Task.CompletedTask;
+            }
+
+            var record = new ChatArchiveRecord(
+                message.Id,
+                owner,
+                message.ThreadId,
+                message.Sender,
+                message.IsMine,
+                message.TextCipher,
+                message.SentAt,
+                message.DeliveryState,
+                message.Attachment?.FileNameCipher,
+                message.Attachment?.SizeBytes,
+                message.Attachment?.Status,
+                message.Attachment?.Progress,
+                message.Attachment?.TransferState);
+            return _archive.UpsertMessageAsync(record, cancellationToken);
         }
 
         private UserProfile RequireUser()
@@ -411,7 +547,7 @@ namespace Local_Network_Messenger.Services
                 return existing;
             }
 
-            var contact = new Contact(contactId, displayName, true, DateTimeOffset.UtcNow, string.Empty, false);
+            var contact = new Contact(contactId, displayName, true, DateTimeOffset.UtcNow, string.Empty, false, null, null);
             _contacts[contactId] = contact;
             return contact;
         }
@@ -429,7 +565,9 @@ namespace Local_Network_Messenger.Services
                 preview,
                 contact.IsOnline,
                 contact.UnreadCount,
-                contact.IsTyping);
+                contact.IsTyping,
+                contact.PingMs,
+                contact.LossPercent);
         }
 
         private async Task<ChatMessageDto> MapMessageAsync(ChatMessage message, CancellationToken cancellationToken)
@@ -444,7 +582,9 @@ namespace Local_Network_Messenger.Services
                     message.Attachment.SizeBytes,
                     message.Attachment.Status,
                     message.Attachment.Progress,
-                    message.Attachment.TransferState);
+                    message.Attachment.TransferState,
+                    message.Attachment.ContentType,
+                    message.Attachment.PreviewDataUrl);
             }
 
             return new ChatMessageDto(
@@ -466,7 +606,9 @@ namespace Local_Network_Messenger.Services
                 true,
                 DateTimeOffset.UtcNow,
                 string.Empty,
-                false);
+                false,
+                null,
+                null);
         }
 
         private static string FormatLastSeen(DateTimeOffset? lastSeenAt, bool isOnline)
@@ -502,7 +644,15 @@ namespace Local_Network_Messenger.Services
 
         private sealed class Contact
         {
-            public Contact(string id, string displayName, bool isOnline, DateTimeOffset? lastSeenAt, string previewCipher, bool isTyping)
+            public Contact(
+                string id,
+                string displayName,
+                bool isOnline,
+                DateTimeOffset? lastSeenAt,
+                string previewCipher,
+                bool isTyping,
+                double? pingMs,
+                double? lossPercent)
             {
                 Id = id;
                 DisplayName = displayName;
@@ -510,6 +660,8 @@ namespace Local_Network_Messenger.Services
                 LastSeenAt = lastSeenAt;
                 PreviewCipher = previewCipher;
                 IsTyping = isTyping;
+                PingMs = pingMs;
+                LossPercent = lossPercent;
             }
 
             public string Id { get; }
@@ -519,13 +671,24 @@ namespace Local_Network_Messenger.Services
             public string PreviewCipher { get; set; }
             public int UnreadCount { get; set; }
             public bool IsTyping { get; set; }
+            public double? PingMs { get; set; }
+            public double? LossPercent { get; set; }
         }
 
-        private sealed record ChatAttachment(string FileNameCipher, long SizeBytes, string Status, double? Progress, string? TransferState)
+        private sealed record ChatAttachment(
+            string FileNameCipher,
+            long SizeBytes,
+            string Status,
+            double? Progress,
+            string? TransferState,
+            string? ContentType,
+            string? PreviewDataUrl)
         {
             public string Status { get; set; } = Status;
             public double? Progress { get; set; } = Progress;
             public string? TransferState { get; set; } = TransferState;
+            public string? ContentType { get; set; } = ContentType;
+            public string? PreviewDataUrl { get; set; } = PreviewDataUrl;
         }
 
         private sealed record ChatMessage(

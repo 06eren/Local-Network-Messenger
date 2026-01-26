@@ -209,6 +209,18 @@
                   </div>
                 </div>
               </div>
+              <div class="room-tools">
+                <div class="room-quality hidden" data-connection-quality></div>
+                <div class="room-search">
+                  <input class="room-search-input" data-message-search placeholder="Mesajlarda ara" type="text" />
+                  <select class="room-filter" data-message-filter>
+                    <option value="all">Tumu</option>
+                    <option value="text">Metin</option>
+                    <option value="files">Dosyalar</option>
+                  </select>
+                  <button class="room-clear" type="button" data-message-clear>Temizle</button>
+                </div>
+              </div>
             </header>
 
             <div class="drop-overlay hidden" data-drop-overlay>
@@ -537,6 +549,54 @@
                   </div>
                   <button class="settings-secondary" type="button" data-diag-refresh>Durum kontrol et</button>
                   <div class="settings-status hidden" data-diag-status></div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Uyari / Olay Gunlugu</div>
+                <div class="settings-card">
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Guvenlik loglari</div>
+                      <div class="settings-item-desc">Son islemler ve guvenlik olaylari.</div>
+                    </div>
+                    <select class="settings-select" data-log-limit>
+                      <option value="50">Son 50</option>
+                      <option value="100">Son 100</option>
+                      <option value="200">Son 200</option>
+                    </select>
+                  </div>
+                  <div class="log-list" data-log-list>
+                    <div class="empty-state">Loglar yukleniyor...</div>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="settings-secondary" type="button" data-log-refresh>Yenile</button>
+                    <button class="settings-secondary" type="button" data-log-download>Log indir</button>
+                  </div>
+                  <div class="settings-status hidden" data-log-status></div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Arsiv</div>
+                <div class="settings-card">
+                  <div class="settings-row-inline">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Arsiv araligi</div>
+                      <div class="settings-item-desc">Disari aktarilacak tarih araligi.</div>
+                    </div>
+                    <select class="settings-select" data-archive-range>
+                      <option value="7">Son 7 gun</option>
+                      <option value="30">Son 30 gun</option>
+                      <option value="all">Tum zamanlar</option>
+                    </select>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="settings-secondary" type="button" data-archive-export-json>JSON indir</button>
+                    <button class="settings-secondary" type="button" data-archive-export-csv>CSV indir</button>
+                    <button class="settings-secondary" type="button" data-archive-clear>Arsivi temizle</button>
+                  </div>
+                  <div class="settings-status hidden" data-archive-status></div>
                 </div>
               </section>
 
