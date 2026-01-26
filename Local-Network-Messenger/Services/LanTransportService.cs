@@ -17,7 +17,8 @@ namespace Local_Network_Messenger.Services
         string DisplayName,
         IPEndPoint EndPoint,
         DateTimeOffset LastSeen,
-        bool IsOnline);
+        bool IsOnline,
+        string Source);
 
     public sealed record LanSendResult(bool Success, int SentCount, string Message);
 
@@ -53,6 +54,7 @@ namespace Local_Network_Messenger.Services
             string from,
             string fromDisplayName,
             string threadId,
+            string messageId,
             string fileName,
             string filePath,
             long sizeBytes,
@@ -61,6 +63,7 @@ namespace Local_Network_Messenger.Services
             From = from;
             FromDisplayName = fromDisplayName;
             ThreadId = threadId;
+            MessageId = messageId;
             FileName = fileName;
             FilePath = filePath;
             SizeBytes = sizeBytes;
@@ -70,10 +73,91 @@ namespace Local_Network_Messenger.Services
         public string From { get; }
         public string FromDisplayName { get; }
         public string ThreadId { get; }
+        public string MessageId { get; }
         public string FileName { get; }
         public string FilePath { get; }
         public long SizeBytes { get; }
         public FileScanResult ScanResult { get; }
+    }
+
+    public sealed class LanChatAckReceivedEventArgs : EventArgs
+    {
+        public LanChatAckReceivedEventArgs(string messageId, string threadId, string status)
+        {
+            MessageId = messageId;
+            ThreadId = threadId;
+            Status = status;
+        }
+
+        public string MessageId { get; }
+        public string ThreadId { get; }
+        public string Status { get; }
+    }
+
+    public sealed class LanChatReadReceivedEventArgs : EventArgs
+    {
+        public LanChatReadReceivedEventArgs(string threadId)
+        {
+            ThreadId = threadId;
+        }
+
+        public string ThreadId { get; }
+    }
+
+    public sealed class LanTypingReceivedEventArgs : EventArgs
+    {
+        public LanTypingReceivedEventArgs(string threadId, string from, bool isTyping)
+        {
+            ThreadId = threadId;
+            From = from;
+            IsTyping = isTyping;
+        }
+
+        public string ThreadId { get; }
+        public string From { get; }
+        public bool IsTyping { get; }
+    }
+
+    public sealed class FileTransferProgressEventArgs : EventArgs
+    {
+        public FileTransferProgressEventArgs(string threadId, string messageId, double progress, bool isOutgoing)
+        {
+            ThreadId = threadId;
+            MessageId = messageId;
+            Progress = progress;
+            IsOutgoing = isOutgoing;
+        }
+
+        public string ThreadId { get; }
+        public string MessageId { get; }
+        public double Progress { get; }
+        public bool IsOutgoing { get; }
+    }
+
+    public sealed class FileTransferStartedEventArgs : EventArgs
+    {
+        public FileTransferStartedEventArgs(
+            string threadId,
+            string messageId,
+            string from,
+            string fromDisplayName,
+            string fileName,
+            long sizeBytes)
+        {
+            ThreadId = threadId;
+            MessageId = messageId;
+            From = from;
+            FromDisplayName = fromDisplayName;
+            FileName = fileName;
+            SizeBytes = sizeBytes;
+        }
+
+        public string ThreadId { get; }
+        public string MessageId { get; }
+        public string From { get; }
+        public string FromDisplayName { get; }
+        public string FileName { get; }
+        public long SizeBytes { get; }
     }
 
     public sealed class LanTransportService : IAsyncDisposable
@@ -90,17 +174,34 @@ namespace Local_Network_Messenger.Services
         };
         private readonly ConcurrentDictionary<string, PeerInfo> _peers = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, FileReceiveSession> _incomingFiles = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, bool> _manualPeers = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, RelayClientSession> _relaySessions = new(StringComparer.OrdinalIgnoreCase);
+        private readonly SemaphoreSlim _relayWriteLock = new(1, 1);
         private readonly string _instanceId = Guid.NewGuid().ToString("N");
         private readonly int _discoveryPort;
         private int _listenPort;
         private UdpClient? _udpClient;
         private TcpListener? _listener;
+        private TcpListener? _relayListener;
         private CancellationTokenSource? _cts;
+        private CancellationTokenSource? _relayClientCts;
+        private CancellationTokenSource? _relayServerCts;
         private Task? _udpReceiveTask;
         private Task? _announceTask;
         private Task? _cleanupTask;
         private Task? _acceptTask;
+        private Task? _relayAcceptTask;
+        private Task? _relayReceiveTask;
         private UserProfile? _user;
+        private TcpClient? _relayClient;
+        private StreamReader? _relayReader;
+        private StreamWriter? _relayWriter;
+        private string? _relayHost;
+        private int _relayPort;
+        private string _relayMode = "local";
+        private bool _relayEnabled;
+        private IPEndPoint? _relayServerEndPoint;
+        private bool _relayConnected;
 
         public LanTransportService(MessageCipher cipher, IFileScanService scanService, int discoveryPort, int listenPort)
         {
@@ -113,10 +214,19 @@ namespace Local_Network_Messenger.Services
         public event EventHandler<PeerChangedEventArgs>? PeerChanged;
         public event EventHandler<LanMessageReceivedEventArgs>? MessageReceived;
         public event EventHandler<LanFileReceivedEventArgs>? FileReceived;
+        public event EventHandler<LanChatAckReceivedEventArgs>? ChatAckReceived;
+        public event EventHandler<LanChatReadReceivedEventArgs>? ChatReadReceived;
+        public event EventHandler<LanTypingReceivedEventArgs>? TypingReceived;
+        public event EventHandler<FileTransferProgressEventArgs>? FileTransferProgress;
+        public event EventHandler<FileTransferStartedEventArgs>? FileTransferStarted;
 
         public int ListenPort => _listenPort;
 
         public IEnumerable<PeerInfo> Peers => _peers.Values;
+
+        public int ManualPeerCount => _manualPeers.Count;
+
+        public bool IsRelayConnected => _relayConnected;
 
         public async Task StartAsync(UserProfile user, CancellationToken cancellationToken)
         {
@@ -181,9 +291,95 @@ namespace Local_Network_Messenger.Services
             _listener = null;
             _peers.Clear();
             _incomingFiles.Clear();
+            _manualPeers.Clear();
+
+            await StopRelayClientAsync();
+            await StopRelayServerAsync();
         }
 
-        public async Task<LanSendResult> SendMessageAsync(string targetUser, string text, CancellationToken cancellationToken)
+        public async Task<PeerInfo?> AddManualPeerAsync(string host, int port, string? displayName, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(host))
+            {
+                return null;
+            }
+
+            if (port <= 0)
+            {
+                port = _listenPort;
+            }
+
+            IPAddress[] addresses;
+            try
+            {
+                addresses = await Dns.GetHostAddressesAsync(host);
+            }
+            catch (SocketException)
+            {
+                return null;
+            }
+
+            var address = Array.Find(addresses, ip => ip.AddressFamily == AddressFamily.InterNetwork);
+            if (address == null)
+            {
+                return null;
+            }
+
+            var endPoint = new IPEndPoint(address, port);
+            var ack = await SendPeerHelloAsync(endPoint, cancellationToken);
+            if (ack == null)
+            {
+                return null;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var peer = new PeerInfo(
+                ack.Username,
+                string.IsNullOrWhiteSpace(displayName) ? ack.DisplayName : displayName!,
+                new IPEndPoint(address, ack.ListenPort),
+                now,
+                true,
+                "manual");
+
+            _peers[peer.Username] = peer;
+            _manualPeers[peer.Username] = true;
+            PeerChanged?.Invoke(this, new PeerChangedEventArgs(peer));
+            return peer;
+        }
+
+        public async Task ConfigureRelayAsync(AppConfig config, UserProfile? user, CancellationToken cancellationToken)
+        {
+            _relayEnabled = config.EffectiveRelayEnabled;
+            _relayMode = config.EffectiveRelayMode;
+            _relayHost = string.IsNullOrWhiteSpace(config.RelayHost) ? null : config.RelayHost.Trim();
+            _relayPort = config.EffectiveRelayPort;
+
+            if (config.RelayServerEnabled == true)
+            {
+                await StartRelayServerAsync(config.EffectiveRelayServerPort, cancellationToken);
+            }
+            else
+            {
+                await StopRelayServerAsync();
+            }
+
+            if (!_relayEnabled ||
+                string.Equals(_relayMode, "local", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(_relayHost))
+            {
+                await StopRelayClientAsync();
+                return;
+            }
+
+            await StartRelayClientAsync(_relayHost, _relayPort, user ?? _user, cancellationToken);
+        }
+
+        public async Task<LanSendResult> SendMessageAsync(string targetUser, string text, string messageId, CancellationToken cancellationToken)
         {
             if (_user == null)
             {
@@ -192,6 +388,12 @@ namespace Local_Network_Messenger.Services
 
             if (string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase))
             {
+                if (UseRelayForAll())
+                {
+                    var sent = await SendRelayMessageAsync("all", text, messageId, cancellationToken);
+                    return new LanSendResult(sent, sent ? 1 : 0, sent ? "Gonderildi." : "Relay baglantisi yok.");
+                }
+
                 return await BroadcastMessageAsync(text, cancellationToken);
             }
 
@@ -200,14 +402,27 @@ namespace Local_Network_Messenger.Services
                 return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
             }
 
+            if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase) && !_relayConnected)
+            {
+                return new LanSendResult(false, 0, "Relay baglantisi yok.");
+            }
+
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                var sent = await SendRelayMessageAsync(targetUser, text, messageId, cancellationToken);
+                return new LanSendResult(sent, sent ? 1 : 0, sent ? "Gonderildi." : "Relay baglantisi yok.");
+            }
+
             var cipherText = await _cipher.EncryptAsync(text, cancellationToken);
             var payload = new LanChatMessage(
+                messageId,
                 _user.Username,
                 _user.DisplayName,
                 targetUser,
                 _user.Username,
                 cipherText,
-                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                _listenPort);
             await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatMessage, payload, cancellationToken);
             return new LanSendResult(true, 1, "Gonderildi.");
         }
@@ -217,6 +432,7 @@ namespace Local_Network_Messenger.Services
             string fileName,
             byte[] data,
             string? contentType,
+            string messageId,
             CancellationToken cancellationToken)
         {
             if (_user == null)
@@ -231,6 +447,7 @@ namespace Local_Network_Messenger.Services
                 data.LongLength,
                 stream,
                 contentType,
+                messageId,
                 cancellationToken);
         }
 
@@ -238,6 +455,7 @@ namespace Local_Network_Messenger.Services
             string targetUser,
             string filePath,
             string? contentType,
+            string messageId,
             CancellationToken cancellationToken)
         {
             if (_user == null)
@@ -258,6 +476,7 @@ namespace Local_Network_Messenger.Services
                 info.Length,
                 stream,
                 contentType,
+                messageId,
                 cancellationToken);
         }
 
@@ -269,6 +488,579 @@ namespace Local_Network_Messenger.Services
         public async ValueTask DisposeAsync()
         {
             await StopAsync();
+        }
+
+        private async Task StartRelayServerAsync(int port, CancellationToken cancellationToken)
+        {
+            if (_relayListener != null)
+            {
+                if (_relayListener.LocalEndpoint is IPEndPoint endpoint && endpoint.Port == port)
+                {
+                    return;
+                }
+
+                await StopRelayServerAsync();
+            }
+
+            _relayListener = new TcpListener(IPAddress.Any, port);
+            _relayListener.Start();
+            _relayServerCts = new CancellationTokenSource();
+            _relayAcceptTask = Task.Run(() => AcceptRelayLoopAsync(_relayServerCts.Token), _relayServerCts.Token);
+        }
+
+        private async Task StopRelayServerAsync()
+        {
+            if (_relayListener == null && _relayServerCts == null)
+            {
+                return;
+            }
+
+            _relayServerCts?.Cancel();
+            try
+            {
+                _relayListener?.Stop();
+            }
+            catch (SocketException)
+            {
+            }
+
+            if (_relayAcceptTask != null)
+            {
+                try
+                {
+                    await _relayAcceptTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
+            foreach (var session in _relaySessions.Values)
+            {
+                try
+                {
+                    session.Client.Close();
+                }
+                catch (SocketException)
+                {
+                }
+            }
+
+            _relaySessions.Clear();
+            _relayServerCts?.Dispose();
+            _relayServerCts = null;
+            _relayAcceptTask = null;
+            _relayListener = null;
+        }
+
+        private async Task AcceptRelayLoopAsync(CancellationToken cancellationToken)
+        {
+            if (_relayListener == null)
+            {
+                return;
+            }
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                TcpClient? client = null;
+                try
+                {
+                    client = await _relayListener.AcceptTcpClientAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return;
+                }
+                catch (SocketException)
+                {
+                    continue;
+                }
+
+                _ = Task.Run(() => HandleRelayClientAsync(client, cancellationToken), cancellationToken);
+            }
+        }
+
+        private async Task HandleRelayClientAsync(TcpClient client, CancellationToken cancellationToken)
+        {
+            using var clientScope = client;
+            await using var stream = client.GetStream();
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            using var writer = new StreamWriter(stream, Encoding.UTF8)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+
+            RelayClientSession? session = null;
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                string? line;
+                try
+                {
+                    line = await reader.ReadLineAsync();
+                }
+                catch (IOException)
+                {
+                    break;
+                }
+
+                if (line == null)
+                {
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                RelayPacket? packet;
+                try
+                {
+                    packet = JsonSerializer.Deserialize<RelayPacket>(line, _jsonOptions);
+                }
+                catch (JsonException)
+                {
+                    continue;
+                }
+
+                if (packet == null)
+                {
+                    continue;
+                }
+
+                if (string.Equals(packet.Type, RelayPacketTypes.Register, StringComparison.OrdinalIgnoreCase))
+                {
+                    RelayRegister? register;
+                    try
+                    {
+                        register = packet.Payload.Deserialize<RelayRegister>(_jsonOptions);
+                    }
+                    catch (JsonException)
+                    {
+                        continue;
+                    }
+
+                    if (register == null || string.IsNullOrWhiteSpace(register.Username))
+                    {
+                        continue;
+                    }
+
+                    var username = register.Username.Trim();
+                    var displayName = string.IsNullOrWhiteSpace(register.DisplayName)
+                        ? username
+                        : register.DisplayName.Trim();
+                    session = new RelayClientSession(client, writer, username, displayName);
+                    _relaySessions.AddOrUpdate(
+                        username,
+                        _ => session,
+                        (_, existing) =>
+                        {
+                            try
+                            {
+                                existing.Client.Close();
+                            }
+                            catch (SocketException)
+                            {
+                            }
+
+                            return session;
+                        });
+
+                    await SendRelayPeerListAsync(session, cancellationToken);
+                    await BroadcastRelayPresenceAsync(session, cancellationToken);
+                    continue;
+                }
+
+                if (session == null)
+                {
+                    continue;
+                }
+
+                await RouteRelayPacketAsync(session, packet, cancellationToken);
+            }
+
+            if (session != null)
+            {
+                _relaySessions.TryRemove(session.Username, out _);
+                await BroadcastRelayOfflineAsync(session, CancellationToken.None);
+            }
+        }
+
+        private async Task SendRelayPeerListAsync(RelayClientSession session, CancellationToken cancellationToken)
+        {
+            foreach (var entry in _relaySessions.Values)
+            {
+                if (string.Equals(entry.Username, session.Username, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var payload = new LanPeerHello(entry.Username, entry.DisplayName, 0);
+                var packet = new RelayPacket(
+                    LanPacketTypes.PeerHello,
+                    session.Username,
+                    JsonSerializer.SerializeToElement(payload, _jsonOptions));
+                await SendRelayPacketToSessionAsync(session, packet, cancellationToken);
+            }
+        }
+
+        private async Task BroadcastRelayPresenceAsync(RelayClientSession session, CancellationToken cancellationToken)
+        {
+            var payload = new LanPeerHello(session.Username, session.DisplayName, 0);
+            var packet = new RelayPacket(
+                LanPacketTypes.PeerHello,
+                "all",
+                JsonSerializer.SerializeToElement(payload, _jsonOptions));
+
+            foreach (var entry in _relaySessions.Values)
+            {
+                if (string.Equals(entry.Username, session.Username, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                await SendRelayPacketToSessionAsync(entry, packet, cancellationToken);
+            }
+        }
+
+        private async Task BroadcastRelayOfflineAsync(RelayClientSession session, CancellationToken cancellationToken)
+        {
+            var payload = new LanPeerOffline(session.Username, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            var packet = new RelayPacket(
+                LanPacketTypes.PeerOffline,
+                "all",
+                JsonSerializer.SerializeToElement(payload, _jsonOptions));
+
+            foreach (var entry in _relaySessions.Values)
+            {
+                if (string.Equals(entry.Username, session.Username, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                await SendRelayPacketToSessionAsync(entry, packet, cancellationToken);
+            }
+        }
+
+        private async Task RouteRelayPacketAsync(RelayClientSession sender, RelayPacket packet, CancellationToken cancellationToken)
+        {
+            if (string.Equals(packet.To, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var entry in _relaySessions.Values)
+                {
+                    if (string.Equals(entry.Username, sender.Username, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    await SendRelayPacketToSessionAsync(entry, packet, cancellationToken);
+                }
+
+                return;
+            }
+
+            if (_relaySessions.TryGetValue(packet.To, out var target))
+            {
+                await SendRelayPacketToSessionAsync(target, packet, cancellationToken);
+            }
+        }
+
+        private async Task SendRelayPacketToSessionAsync(
+            RelayClientSession session,
+            RelayPacket packet,
+            CancellationToken cancellationToken)
+        {
+            var json = JsonSerializer.Serialize(packet, _jsonOptions);
+            await session.SendLock.WaitAsync(cancellationToken);
+            try
+            {
+                await session.Writer.WriteLineAsync(json);
+            }
+            finally
+            {
+                session.SendLock.Release();
+            }
+        }
+
+        private async Task StartRelayClientAsync(string host, int port, UserProfile? user, CancellationToken cancellationToken)
+        {
+            if (user == null)
+            {
+                return;
+            }
+
+            if (_relayClient != null &&
+                _relayConnected &&
+                string.Equals(_relayHost, host, StringComparison.OrdinalIgnoreCase) &&
+                _relayPort == port)
+            {
+                return;
+            }
+
+            await StopRelayClientAsync();
+
+            var client = new TcpClient();
+            try
+            {
+                await client.ConnectAsync(host, port, cancellationToken);
+            }
+            catch (SocketException)
+            {
+                _relayConnected = false;
+                return;
+            }
+
+            _relayClient = client;
+            _relayHost = host;
+            _relayPort = port;
+            _relayServerEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
+            _relayClientCts = new CancellationTokenSource();
+            var token = _relayClientCts.Token;
+
+            var stream = client.GetStream();
+            _relayReader = new StreamReader(stream, Encoding.UTF8);
+            _relayWriter = new StreamWriter(stream, Encoding.UTF8)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+
+            _relayConnected = true;
+            _relayReceiveTask = Task.Run(() => ReceiveRelayLoopAsync(token), token);
+            await SendRelayRegisterAsync(user, cancellationToken);
+        }
+
+        private async Task StopRelayClientAsync()
+        {
+            if (_relayClient == null && _relayClientCts == null)
+            {
+                return;
+            }
+
+            _relayConnected = false;
+            _relayClientCts?.Cancel();
+            try
+            {
+                _relayClient?.Close();
+            }
+            catch (SocketException)
+            {
+            }
+
+            if (_relayReceiveTask != null)
+            {
+                try
+                {
+                    await _relayReceiveTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
+            _relayClientCts?.Dispose();
+            _relayClientCts = null;
+            _relayReceiveTask = null;
+            _relayClient = null;
+            _relayReader = null;
+            _relayWriter = null;
+            _relayServerEndPoint = null;
+            MarkRelayPeersOffline();
+        }
+
+        private async Task ReceiveRelayLoopAsync(CancellationToken cancellationToken)
+        {
+            if (_relayReader == null)
+            {
+                return;
+            }
+
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var line = await _relayReader.ReadLineAsync();
+                    if (line == null)
+                    {
+                        break;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    RelayPacket? packet;
+                    try
+                    {
+                        packet = JsonSerializer.Deserialize<RelayPacket>(line, _jsonOptions);
+                    }
+                    catch (JsonException)
+                    {
+                        continue;
+                    }
+
+                    if (packet == null)
+                    {
+                        continue;
+                    }
+
+                    await HandleRelayPacketAsync(packet, cancellationToken);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            finally
+            {
+                _relayConnected = false;
+                MarkRelayPeersOffline();
+            }
+        }
+
+        private async Task HandleRelayPacketAsync(RelayPacket packet, CancellationToken cancellationToken)
+        {
+            switch (packet.Type)
+            {
+                case LanPacketTypes.PeerHello:
+                    await HandleRelayPeerHelloAsync(packet.Payload, cancellationToken);
+                    break;
+                case LanPacketTypes.PeerOffline:
+                    await HandleRelayPeerOfflineAsync(packet.Payload, cancellationToken);
+                    break;
+                case LanPacketTypes.ChatMessage:
+                    await HandleChatMessageAsync(packet.Payload, null, true, cancellationToken);
+                    break;
+                case LanPacketTypes.ChatAck:
+                    await HandleChatAckAsync(packet.Payload, cancellationToken);
+                    break;
+                case LanPacketTypes.ChatRead:
+                    await HandleChatReadAsync(packet.Payload, cancellationToken);
+                    break;
+                case LanPacketTypes.ChatTyping:
+                    await HandleChatTypingAsync(packet.Payload, cancellationToken);
+                    break;
+                case LanPacketTypes.FileStart:
+                    await HandleFileStartAsync(packet.Payload, null, true, cancellationToken);
+                    break;
+                case LanPacketTypes.FileChunk:
+                    await HandleFileChunkAsync(packet.Payload, cancellationToken);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        private async Task<bool> SendRelayMessageAsync(string targetUser, string text, string messageId, CancellationToken cancellationToken)
+        {
+            if (_user == null || !_relayConnected)
+            {
+                return false;
+            }
+
+            var cipherText = await _cipher.EncryptAsync(text, cancellationToken);
+            var payload = new LanChatMessage(
+                messageId,
+                _user.Username,
+                _user.DisplayName,
+                targetUser,
+                _user.Username,
+                cipherText,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                _listenPort);
+            await SendRelayPacketAsync(LanPacketTypes.ChatMessage, targetUser, payload, cancellationToken);
+            return true;
+        }
+
+        private async Task<bool> SendFileViaRelayAsync(
+            string targetUser,
+            string fileName,
+            long sizeBytes,
+            Stream stream,
+            string? contentType,
+            string fileId,
+            CancellationToken cancellationToken,
+            string? sha256Base64 = null)
+        {
+            if (_user == null || !_relayConnected)
+            {
+                return false;
+            }
+
+            var sha256 = sha256Base64 ?? await ComputeSha256Base64Async(stream, cancellationToken);
+            if (stream.CanSeek)
+            {
+                stream.Position = 0;
+            }
+
+            var nameCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
+            var startPayload = new LanFileStart(
+                fileId,
+                _user.Username,
+                _user.DisplayName,
+                targetUser,
+                nameCipher,
+                sizeBytes,
+                contentType,
+                sha256,
+                _listenPort);
+            await SendRelayPacketAsync(LanPacketTypes.FileStart, targetUser, startPayload, cancellationToken);
+
+            var buffer = new byte[ChunkSize];
+            var index = 0;
+            long sentBytes = 0;
+            int read;
+            while ((read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)) > 0)
+            {
+                sentBytes += read;
+                var base64 = Convert.ToBase64String(buffer, 0, read);
+                var cipher = await _cipher.EncryptAsync(base64, cancellationToken);
+                var isLast = sentBytes >= sizeBytes;
+                var chunkPayload = new LanFileChunk(fileId, index, cipher, isLast);
+                await SendRelayPacketAsync(LanPacketTypes.FileChunk, targetUser, chunkPayload, cancellationToken);
+                var progress = sizeBytes > 0 ? Math.Min(100, (sentBytes * 100d) / sizeBytes) : 0;
+                var threadId = string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase)
+                    ? "all"
+                    : targetUser;
+                FileTransferProgress?.Invoke(
+                    this,
+                    new FileTransferProgressEventArgs(threadId, fileId, progress, true));
+                index += 1;
+            }
+
+            return true;
+        }
+
+        private async Task SendRelayRegisterAsync(UserProfile user, CancellationToken cancellationToken)
+        {
+            var payload = new RelayRegister(user.Username, user.DisplayName);
+            await SendRelayPacketAsync(RelayPacketTypes.Register, "server", payload, cancellationToken);
+        }
+
+        private async Task SendRelayPacketAsync(string type, string to, object payload, CancellationToken cancellationToken)
+        {
+            if (_relayWriter == null)
+            {
+                return;
+            }
+
+            var packet = new RelayPacket(type, to, JsonSerializer.SerializeToElement(payload, _jsonOptions));
+            var json = JsonSerializer.Serialize(packet, _jsonOptions);
+            await _relayWriteLock.WaitAsync(cancellationToken);
+            try
+            {
+                await _relayWriter.WriteLineAsync(json);
+            }
+            finally
+            {
+                _relayWriteLock.Release();
+            }
         }
 
         private void InitializeUdpListener()
@@ -383,7 +1175,7 @@ namespace Local_Network_Messenger.Services
 
                 var now = DateTimeOffset.UtcNow;
                 var endPoint = new IPEndPoint(result.RemoteEndPoint.Address, announcement.TcpPort);
-                var updated = new PeerInfo(announcement.Username, announcement.DisplayName, endPoint, now, true);
+                var updated = new PeerInfo(announcement.Username, announcement.DisplayName, endPoint, now, true, "local");
                 var shouldRaise = false;
                 _peers.AddOrUpdate(
                     updated.Username,
@@ -396,12 +1188,13 @@ namespace Local_Network_Messenger.Services
                     {
                         if (!existing.IsOnline ||
                             !string.Equals(existing.DisplayName, updated.DisplayName, StringComparison.Ordinal) ||
-                            !Equals(existing.EndPoint, updated.EndPoint))
+                            !Equals(existing.EndPoint, updated.EndPoint) ||
+                            !string.Equals(existing.Source, updated.Source, StringComparison.Ordinal))
                         {
                             shouldRaise = true;
                         }
 
-                        return updated with { LastSeen = now, IsOnline = true };
+                        return updated with { LastSeen = now, IsOnline = true, Source = "local" };
                     });
 
                 if (shouldRaise)
@@ -420,6 +1213,11 @@ namespace Local_Network_Messenger.Services
                 {
                     var peer = entry.Value;
                     if (!peer.IsOnline)
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(peer.Source, "local", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -471,9 +1269,15 @@ namespace Local_Network_Messenger.Services
 
         private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
         {
-            using var _ = client;
+            using var clientScope = client;
             await using var stream = client.GetStream();
             using var reader = new StreamReader(stream, Encoding.UTF8);
+            using var writer = new StreamWriter(stream, Encoding.UTF8)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+            var remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -509,11 +1313,26 @@ namespace Local_Network_Messenger.Services
 
                 switch (packet.Type)
                 {
+                    case LanPacketTypes.PeerHello:
+                        await HandlePeerHelloAsync(packet.Payload, remoteEndPoint, writer, cancellationToken);
+                        break;
+                    case LanPacketTypes.PeerHelloAck:
+                        await HandlePeerHelloAckAsync(packet.Payload, remoteEndPoint, cancellationToken);
+                        break;
                     case LanPacketTypes.ChatMessage:
-                        await HandleChatMessageAsync(packet.Payload, cancellationToken);
+                        await HandleChatMessageAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
+                        break;
+                    case LanPacketTypes.ChatAck:
+                        await HandleChatAckAsync(packet.Payload, cancellationToken);
+                        break;
+                    case LanPacketTypes.ChatRead:
+                        await HandleChatReadAsync(packet.Payload, cancellationToken);
+                        break;
+                    case LanPacketTypes.ChatTyping:
+                        await HandleChatTypingAsync(packet.Payload, cancellationToken);
                         break;
                     case LanPacketTypes.FileStart:
-                        await HandleFileStartAsync(packet.Payload, cancellationToken);
+                        await HandleFileStartAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
                         break;
                     case LanPacketTypes.FileChunk:
                         await HandleFileChunkAsync(packet.Payload, cancellationToken);
@@ -524,7 +1343,7 @@ namespace Local_Network_Messenger.Services
             }
         }
 
-        private async Task HandleChatMessageAsync(JsonElement payload, CancellationToken cancellationToken)
+        private async Task HandleChatMessageAsync(JsonElement payload, IPEndPoint? remoteEndPoint, bool viaRelay, CancellationToken cancellationToken)
         {
             LanChatMessage? message;
             try
@@ -546,14 +1365,199 @@ namespace Local_Network_Messenger.Services
                 return;
             }
 
+            if (!viaRelay)
+            {
+                UpsertPeer(message.From, message.FromDisplayName, remoteEndPoint, message.ListenPort, "local");
+            }
+            else
+            {
+                UpsertPeer(message.From, message.FromDisplayName, _relayServerEndPoint, message.ListenPort, "relay");
+            }
             var threadId = string.Equals(message.To, "all", StringComparison.OrdinalIgnoreCase)
                 ? "all"
                 : message.From;
             var text = await _cipher.DecryptAsync(message.CipherText, cancellationToken);
             MessageReceived?.Invoke(this, new LanMessageReceivedEventArgs(message.From, message.FromDisplayName, threadId, text));
+
+            if (!string.Equals(message.To, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                await SendChatAckAsync(message, remoteEndPoint, viaRelay, cancellationToken);
+            }
         }
 
-        private async Task HandleFileStartAsync(JsonElement payload, CancellationToken cancellationToken)
+        private async Task HandleChatAckAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanChatAck? ack;
+            try
+            {
+                ack = payload.Deserialize<LanChatAck>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (ack == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(ack.To))
+            {
+                return;
+            }
+
+            ChatAckReceived?.Invoke(this, new LanChatAckReceivedEventArgs(ack.MessageId, ack.ThreadId, ack.Status));
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleChatReadAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanChatRead? read;
+            try
+            {
+                read = payload.Deserialize<LanChatRead>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (read == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(read.To))
+            {
+                return;
+            }
+
+            ChatReadReceived?.Invoke(this, new LanChatReadReceivedEventArgs(read.ThreadId));
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleChatTypingAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanChatTyping? typing;
+            try
+            {
+                typing = payload.Deserialize<LanChatTyping>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (typing == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(typing.To))
+            {
+                return;
+            }
+
+            TypingReceived?.Invoke(this, new LanTypingReceivedEventArgs(typing.ThreadId, typing.From, typing.IsTyping));
+            await Task.CompletedTask;
+        }
+
+        private async Task HandlePeerHelloAsync(
+            JsonElement payload,
+            IPEndPoint? remoteEndPoint,
+            StreamWriter writer,
+            CancellationToken cancellationToken)
+        {
+            LanPeerHello? hello;
+            try
+            {
+                hello = payload.Deserialize<LanPeerHello>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (hello == null)
+            {
+                return;
+            }
+
+            UpsertPeer(hello.Username, hello.DisplayName, remoteEndPoint, hello.ListenPort, "local");
+            if (_user == null)
+            {
+                return;
+            }
+
+            var ackPayload = new LanPeerHello(_user.Username, _user.DisplayName, _listenPort);
+            await WritePacketAsync(writer, LanPacketTypes.PeerHelloAck, ackPayload, cancellationToken);
+        }
+
+        private async Task HandlePeerHelloAckAsync(JsonElement payload, IPEndPoint? remoteEndPoint, CancellationToken cancellationToken)
+        {
+            LanPeerHello? hello;
+            try
+            {
+                hello = payload.Deserialize<LanPeerHello>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (hello == null)
+            {
+                return;
+            }
+
+            UpsertPeer(hello.Username, hello.DisplayName, remoteEndPoint, hello.ListenPort, "local");
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleRelayPeerHelloAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanPeerHello? hello;
+            try
+            {
+                hello = payload.Deserialize<LanPeerHello>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (hello == null)
+            {
+                return;
+            }
+
+            UpsertPeer(hello.Username, hello.DisplayName, _relayServerEndPoint, hello.ListenPort, "relay");
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleRelayPeerOfflineAsync(JsonElement payload, CancellationToken cancellationToken)
+        {
+            LanPeerOffline? offline;
+            try
+            {
+                offline = payload.Deserialize<LanPeerOffline>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (offline == null)
+            {
+                return;
+            }
+
+            MarkPeerOffline(offline.Username, offline.LastSeenAt);
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleFileStartAsync(JsonElement payload, IPEndPoint? remoteEndPoint, bool viaRelay, CancellationToken cancellationToken)
         {
             LanFileStart? start;
             try
@@ -575,12 +1579,33 @@ namespace Local_Network_Messenger.Services
                 return;
             }
 
+            if (!viaRelay)
+            {
+                UpsertPeer(start.From, start.FromDisplayName, remoteEndPoint, start.FromPort, "local");
+            }
+            else
+            {
+                UpsertPeer(start.From, start.FromDisplayName, _relayServerEndPoint, start.FromPort, "relay");
+            }
             var fileName = await _cipher.DecryptAsync(start.FileNameCipher, cancellationToken);
             var safeName = SanitizeFileName(fileName);
             var filePath = Path.Combine(AppPaths.ReceivedFilesPath, $"{DateTimeOffset.UtcNow:yyyyMMdd_HHmmss}_{safeName}");
             var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 4096, true);
             var session = new FileReceiveSession(start, fileName, filePath, stream);
             _incomingFiles[start.FileId] = session;
+
+            var threadId = string.Equals(start.To, "all", StringComparison.OrdinalIgnoreCase)
+                ? "all"
+                : start.From;
+            FileTransferStarted?.Invoke(
+                this,
+                new FileTransferStartedEventArgs(
+                    threadId,
+                    start.FileId,
+                    start.From,
+                    start.FromDisplayName,
+                    fileName,
+                    start.SizeBytes));
         }
 
         private async Task HandleFileChunkAsync(JsonElement payload, CancellationToken cancellationToken)
@@ -620,6 +1645,15 @@ namespace Local_Network_Messenger.Services
             await session.Stream.WriteAsync(bytes, cancellationToken);
             session.Hash.TransformBlock(bytes, 0, bytes.Length, null, 0);
             session.BytesWritten += bytes.Length;
+            var progress = session.Start.SizeBytes > 0
+                ? Math.Min(100, (session.BytesWritten * 100d) / session.Start.SizeBytes)
+                : 0;
+            var progressThreadId = string.Equals(session.Start.To, "all", StringComparison.OrdinalIgnoreCase)
+                ? "all"
+                : session.Start.From;
+            FileTransferProgress?.Invoke(
+                this,
+                new FileTransferProgressEventArgs(progressThreadId, session.Start.FileId, progress, false));
 
             if (chunk.IsLast || session.BytesWritten >= session.Start.SizeBytes)
             {
@@ -648,6 +1682,7 @@ namespace Local_Network_Messenger.Services
                         session.Start.From,
                         session.Start.FromDisplayName,
                         threadId,
+                        session.Start.FileId,
                         session.FileName,
                         session.FilePath,
                         session.Start.SizeBytes,
@@ -689,10 +1724,308 @@ namespace Local_Network_Messenger.Services
                     session.Start.From,
                     session.Start.FromDisplayName,
                     threadId,
+                    session.Start.FileId,
                     session.FileName,
                     session.FilePath,
                     session.Start.SizeBytes,
                     result));
+        }
+
+        private async Task WritePacketAsync(StreamWriter writer, string type, object payload, CancellationToken cancellationToken)
+        {
+            var packet = new LanPacket(type, JsonSerializer.SerializeToElement(payload, _jsonOptions));
+            var json = JsonSerializer.Serialize(packet, _jsonOptions);
+            await writer.WriteLineAsync(json);
+        }
+
+        private async Task<LanPeerHello?> SendPeerHelloAsync(IPEndPoint endPoint, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return null;
+            }
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(endPoint.Address, endPoint.Port, cancellationToken);
+            await using var stream = client.GetStream();
+            using var writer = new StreamWriter(stream, Encoding.UTF8)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+
+            var payload = new LanPeerHello(_user.Username, _user.DisplayName, _listenPort);
+            await WritePacketAsync(writer, LanPacketTypes.PeerHello, payload, cancellationToken);
+
+            var readTask = reader.ReadLineAsync();
+            var completed = await Task.WhenAny(readTask, Task.Delay(TimeSpan.FromSeconds(4), cancellationToken));
+            if (completed != readTask)
+            {
+                return null;
+            }
+
+            var line = await readTask;
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return null;
+            }
+
+            LanPacket? packet;
+            try
+            {
+                packet = JsonSerializer.Deserialize<LanPacket>(line, _jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+
+            if (packet == null || packet.Type != LanPacketTypes.PeerHelloAck)
+            {
+                return null;
+            }
+
+            try
+            {
+                return packet.Payload.Deserialize<LanPeerHello>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private async Task SendChatAckAsync(LanChatMessage message, IPEndPoint? remoteEndPoint, bool viaRelay, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(message.MessageId))
+            {
+                return;
+            }
+
+            var ack = new LanChatAck(message.MessageId, _user.Username, message.From, message.ThreadId, "delivered");
+
+            if (viaRelay)
+            {
+                await SendRelayPacketAsync(LanPacketTypes.ChatAck, message.From, ack, cancellationToken);
+                return;
+            }
+
+            if (remoteEndPoint == null)
+            {
+                return;
+            }
+
+            var port = message.ListenPort > 0 ? message.ListenPort : remoteEndPoint.Port;
+            var endPoint = new IPEndPoint(remoteEndPoint.Address, port);
+            await SendPacketAsync(endPoint, LanPacketTypes.ChatAck, ack, cancellationToken);
+        }
+
+        public async Task SendReadReceiptAsync(string targetUser, string threadId, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            if (string.Equals(threadId, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (!_peers.TryGetValue(targetUser, out var peer) || !peer.IsOnline)
+            {
+                return;
+            }
+
+            var read = new LanChatRead(_user.Username, targetUser, threadId, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                await SendRelayPacketAsync(LanPacketTypes.ChatRead, targetUser, read, cancellationToken);
+                return;
+            }
+
+            if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatRead, read, cancellationToken);
+        }
+
+        public async Task SendTypingAsync(string targetUser, string threadId, bool isTyping, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            if (string.Equals(threadId, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (!_peers.TryGetValue(targetUser, out var peer) || !peer.IsOnline)
+            {
+                return;
+            }
+
+            var payload = new LanChatTyping(_user.Username, targetUser, threadId, isTyping);
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                await SendRelayPacketAsync(LanPacketTypes.ChatTyping, targetUser, payload, cancellationToken);
+                return;
+            }
+
+            if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatTyping, payload, cancellationToken);
+        }
+
+        private void UpsertPeer(string username, string displayName, IPEndPoint? remoteEndPoint, int listenPort, string source)
+        {
+            if (_user == null)
+            {
+                return;
+            }
+
+            if (string.Equals(username, _user.Username, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var endPoint = ResolvePeerEndPoint(remoteEndPoint, listenPort, source);
+            if (endPoint == null)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var updated = new PeerInfo(username, displayName, endPoint, now, true, source);
+
+            var shouldRaise = false;
+            _peers.AddOrUpdate(
+                updated.Username,
+                _ =>
+                {
+                    shouldRaise = true;
+                    return updated;
+                },
+                (_, existing) =>
+                {
+                    if (!existing.IsOnline ||
+                        !string.Equals(existing.DisplayName, updated.DisplayName, StringComparison.Ordinal) ||
+                        !Equals(existing.EndPoint, updated.EndPoint) ||
+                        !string.Equals(existing.Source, updated.Source, StringComparison.Ordinal))
+                    {
+                        shouldRaise = true;
+                    }
+
+                    return updated with { LastSeen = now, IsOnline = true, Source = updated.Source };
+                });
+
+            if (shouldRaise)
+            {
+                PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
+            }
+        }
+
+        private IPEndPoint? ResolvePeerEndPoint(IPEndPoint? remoteEndPoint, int listenPort, string source)
+        {
+            if (remoteEndPoint != null)
+            {
+                var port = listenPort > 0 ? listenPort : remoteEndPoint.Port;
+                return new IPEndPoint(remoteEndPoint.Address, port);
+            }
+
+            if (string.Equals(source, "relay", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_relayServerEndPoint != null)
+                {
+                    return _relayServerEndPoint;
+                }
+
+                return new IPEndPoint(IPAddress.Loopback, 0);
+            }
+
+            return null;
+        }
+
+        private bool ShouldUseRelay(string targetUser, PeerInfo peer)
+        {
+            if (!_relayConnected)
+            {
+                return false;
+            }
+
+            if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return _relayEnabled && string.Equals(_relayMode, "relay", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool UseRelayForAll()
+        {
+            if (!_relayConnected)
+            {
+                return false;
+            }
+
+            return _relayEnabled && string.Equals(_relayMode, "relay", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void MarkRelayPeersOffline()
+        {
+            var now = DateTimeOffset.UtcNow;
+            foreach (var entry in _peers)
+            {
+                var peer = entry.Value;
+                if (!peer.IsOnline)
+                {
+                    continue;
+                }
+
+                if (!string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var updated = peer with { IsOnline = false, LastSeen = now };
+                _peers[entry.Key] = updated;
+                PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
+            }
+        }
+
+        private void MarkPeerOffline(string username, long lastSeenAt)
+        {
+            if (!_peers.TryGetValue(username, out var peer))
+            {
+                return;
+            }
+
+            DateTimeOffset lastSeen;
+            try
+            {
+                lastSeen = DateTimeOffset.FromUnixTimeMilliseconds(lastSeenAt);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                lastSeen = DateTimeOffset.UtcNow;
+            }
+
+            var updated = peer with { IsOnline = false, LastSeen = lastSeen };
+            _peers[username] = updated;
+            PeerChanged?.Invoke(this, new PeerChangedEventArgs(updated));
         }
 
         private async Task SendPacketAsync(IPEndPoint endPoint, string type, object payload, CancellationToken cancellationToken)
@@ -716,6 +2049,7 @@ namespace Local_Network_Messenger.Services
             long sizeBytes,
             Stream stream,
             string? contentType,
+            string messageId,
             CancellationToken cancellationToken)
         {
             if (_user == null)
@@ -723,14 +2057,29 @@ namespace Local_Network_Messenger.Services
                 return new LanSendResult(false, 0, "Oturum bulunamadi.");
             }
 
+            var fileId = string.IsNullOrWhiteSpace(messageId)
+                ? Guid.NewGuid().ToString("N")
+                : messageId;
+
             if (string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase))
             {
-                return await BroadcastFileStreamAsync(fileName, sizeBytes, stream, contentType, cancellationToken);
+                if (UseRelayForAll())
+                {
+                    var sent = await SendFileViaRelayAsync("all", fileName, sizeBytes, stream, contentType, fileId, cancellationToken);
+                    return new LanSendResult(sent, sent ? 1 : 0, sent ? "Gonderildi." : "Relay baglantisi yok.");
+                }
+
+                return await BroadcastFileStreamAsync(fileName, sizeBytes, stream, contentType, fileId, cancellationToken);
             }
 
             if (!_peers.TryGetValue(targetUser, out var peer) || !peer.IsOnline)
             {
                 return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
+            }
+
+            if (string.Equals(peer.Source, "relay", StringComparison.OrdinalIgnoreCase) && !_relayConnected)
+            {
+                return new LanSendResult(false, 0, "Relay baglantisi yok.");
             }
 
             var sha256 = await ComputeSha256Base64Async(stream, cancellationToken);
@@ -739,7 +2088,13 @@ namespace Local_Network_Messenger.Services
                 stream.Position = 0;
             }
 
-            await SendFileToPeerAsync(peer.EndPoint, targetUser, fileName, sizeBytes, stream, contentType, sha256, cancellationToken);
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                var sent = await SendFileViaRelayAsync(targetUser, fileName, sizeBytes, stream, contentType, fileId, cancellationToken, sha256);
+                return new LanSendResult(sent, sent ? 1 : 0, sent ? "Gonderildi." : "Relay baglantisi yok.");
+            }
+
+            await SendFileToPeerAsync(peer.EndPoint, targetUser, fileName, sizeBytes, stream, contentType, sha256, fileId, cancellationToken);
             return new LanSendResult(true, 1, "Gonderildi.");
         }
 
@@ -751,6 +2106,7 @@ namespace Local_Network_Messenger.Services
             Stream stream,
             string? contentType,
             string? sha256Base64,
+            string fileId,
             CancellationToken cancellationToken)
         {
             if (_user == null)
@@ -767,7 +2123,6 @@ namespace Local_Network_Messenger.Services
                 NewLine = "\n"
             };
 
-            var fileId = Guid.NewGuid().ToString("N");
             var nameCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
             var startPayload = new LanFileStart(
                 fileId,
@@ -777,7 +2132,8 @@ namespace Local_Network_Messenger.Services
                 nameCipher,
                 sizeBytes,
                 contentType,
-                sha256Base64);
+                sha256Base64,
+                _listenPort);
             var startPacket = new LanPacket(LanPacketTypes.FileStart, JsonSerializer.SerializeToElement(startPayload, _jsonOptions));
             await writer.WriteLineAsync(JsonSerializer.Serialize(startPacket, _jsonOptions));
 
@@ -794,6 +2150,13 @@ namespace Local_Network_Messenger.Services
                 var chunkPayload = new LanFileChunk(fileId, index, cipher, isLast);
                 var chunkPacket = new LanPacket(LanPacketTypes.FileChunk, JsonSerializer.SerializeToElement(chunkPayload, _jsonOptions));
                 await writer.WriteLineAsync(JsonSerializer.Serialize(chunkPacket, _jsonOptions));
+                var progress = sizeBytes > 0 ? Math.Min(100, (sentBytes * 100d) / sizeBytes) : 0;
+                var threadId = string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase)
+                    ? "all"
+                    : targetUser;
+                FileTransferProgress?.Invoke(
+                    this,
+                    new FileTransferProgressEventArgs(threadId, fileId, progress, true));
                 index += 1;
             }
         }
@@ -818,12 +2181,14 @@ namespace Local_Network_Messenger.Services
                 {
                     var cipherText = await _cipher.EncryptAsync(text, cancellationToken);
                     var payload = new LanChatMessage(
+                        Guid.NewGuid().ToString("N"),
                         _user!.Username,
                         _user.DisplayName,
                         "all",
                         "all",
                         cipherText,
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        _listenPort);
                     await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatMessage, payload, cancellationToken);
                     sent += 1;
                 }
@@ -844,6 +2209,7 @@ namespace Local_Network_Messenger.Services
             long sizeBytes,
             Stream stream,
             string? contentType,
+            string fileId,
             CancellationToken cancellationToken)
         {
             var peers = _peers.Values;
@@ -877,7 +2243,7 @@ namespace Local_Network_Messenger.Services
                         break;
                     }
 
-                    await SendFileToPeerAsync(peer.EndPoint, "all", fileName, sizeBytes, stream, contentType, sha256, cancellationToken);
+                    await SendFileToPeerAsync(peer.EndPoint, "all", fileName, sizeBytes, stream, contentType, sha256, fileId, cancellationToken);
                     sent += 1;
                 }
                 catch (SocketException)
@@ -929,6 +2295,23 @@ namespace Local_Network_Messenger.Services
                 safe = safe.Replace(ch, '_');
             }
             return string.IsNullOrWhiteSpace(safe) ? "dosya.bin" : safe;
+        }
+
+        private sealed class RelayClientSession
+        {
+            public RelayClientSession(TcpClient client, StreamWriter writer, string username, string displayName)
+            {
+                Client = client;
+                Writer = writer;
+                Username = username;
+                DisplayName = displayName;
+            }
+
+            public TcpClient Client { get; }
+            public StreamWriter Writer { get; }
+            public string Username { get; }
+            public string DisplayName { get; }
+            public SemaphoreSlim SendLock { get; } = new(1, 1);
         }
 
         private sealed class FileReceiveSession

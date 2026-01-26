@@ -30,6 +30,26 @@
   const settingsFields = Array.from(document.querySelectorAll("[data-setting]"));
   const twoFactorToggle = document.querySelector("[data-setting=\"twoFactor\"]");
   const twoFactorMethod = document.querySelector("[data-setting=\"twoFactorMethod\"]");
+  const typingIndicator = document.querySelector("[data-typing-indicator]");
+  const networkKeyInput = document.querySelector("[data-network-key]");
+  const networkKeyButton = document.querySelector("[data-network-key-btn]");
+  const manualPeerInput = document.querySelector("[data-manual-peer]");
+  const manualPeerButton = document.querySelector("[data-manual-peer-btn]");
+  const relayHostInput = document.querySelector("[data-relay-host]");
+  const relayPortInput = document.querySelector("[data-relay-port]");
+  const relayModeSelect = document.querySelector("[data-relay-mode]");
+  const relayEnabledToggle = document.querySelector("[data-relay-enabled]");
+  const relayServerToggle = document.querySelector("[data-relay-server-enabled]");
+  const relayServerPortInput = document.querySelector("[data-relay-server-port]");
+  const relaySaveButton = document.querySelector("[data-relay-save]");
+  const relayStatusEl = document.querySelector("[data-relay-status]");
+  const diagRefreshButton = document.querySelector("[data-diag-refresh]");
+  const diagStatusEl = document.querySelector("[data-diag-status]");
+  const diagFirewallEl = document.querySelector("[data-diag-firewall]");
+  const diagPortsEl = document.querySelector("[data-diag-ports]");
+  const diagCryptoEl = document.querySelector("[data-diag-crypto]");
+  const diagScanEl = document.querySelector("[data-diag-scan]");
+  const diagRelayEl = document.querySelector("[data-diag-relay]");
 
   const inputs = {
     username: document.querySelector("[data-field=\"username\"]"),
@@ -69,6 +89,8 @@
   };
   let dragCounter = 0;
   let uiStatusTimer = null;
+  let typingTimer = null;
+  let typingActive = false;
 
   const copy = {
     login: {
@@ -195,6 +217,26 @@
     settingsStatusEl.classList.toggle("hidden", message.length === 0);
   };
 
+  const setRelayStatus = (message, tone = "info") => {
+    if (!relayStatusEl) {
+      return;
+    }
+
+    relayStatusEl.textContent = message;
+    relayStatusEl.dataset.tone = tone;
+    relayStatusEl.classList.toggle("hidden", message.length === 0);
+  };
+
+  const setDiagStatus = (message, tone = "info") => {
+    if (!diagStatusEl) {
+      return;
+    }
+
+    diagStatusEl.textContent = message;
+    diagStatusEl.dataset.tone = tone;
+    diagStatusEl.classList.toggle("hidden", message.length === 0);
+  };
+
   const loadSettings = () => {
     try {
       const raw = localStorage.getItem("lnm.settings");
@@ -254,6 +296,73 @@
     localStorage.setItem("lnm.settings", JSON.stringify(settings));
   };
 
+  const applyDiagnostics = (snapshot) => {
+    if (!snapshot) {
+      return;
+    }
+
+    const firewallLabel = snapshot.firewall?.ok
+      ? "Acik"
+      : (snapshot.firewall?.message || "Kapali");
+    if (diagFirewallEl) {
+      diagFirewallEl.textContent = `${firewallLabel}`;
+    }
+    if (diagPortsEl) {
+      const discovery = snapshot.ports?.discovery ?? "-";
+      const tcp = snapshot.ports?.tcp ?? "-";
+      diagPortsEl.textContent = `UDP ${discovery} / TCP ${tcp}`;
+    }
+    if (diagCryptoEl) {
+      const mode = snapshot.crypto?.mode ?? "unknown";
+      diagCryptoEl.textContent = mode === "dll" ? "DLL aktif" : mode === "process" ? "Proses" : "Pasif";
+    }
+    if (diagScanEl) {
+      const mode = snapshot.scan?.mode ?? "basic";
+      diagScanEl.textContent = mode === "pythonnet" ? "Python.NET" : mode === "process" ? "Proses" : "Basit";
+    }
+    if (diagRelayEl) {
+      const relay = snapshot.relay ?? {};
+      const state = relay.connected ? "Bagli" : "Kapali";
+      const mode = relay.mode || "local";
+      const host = relay.host ? ` (${relay.host})` : "";
+      diagRelayEl.textContent = `${mode} / ${state}${host}`;
+    }
+
+    if (relayHostInput) {
+      relayHostInput.value = snapshot.relay?.host ?? "";
+    }
+    if (relayPortInput) {
+      relayPortInput.value = snapshot.relay?.port ? String(snapshot.relay.port) : "";
+    }
+    if (relayServerPortInput) {
+      relayServerPortInput.value = snapshot.relay?.serverPort ? String(snapshot.relay.serverPort) : "";
+    }
+    if (relayEnabledToggle) {
+      relayEnabledToggle.checked = Boolean(snapshot.relay?.enabled);
+    }
+    if (relayServerToggle) {
+      relayServerToggle.checked = Boolean(snapshot.relay?.serverEnabled);
+    }
+    if (relayModeSelect) {
+      relayModeSelect.value = snapshot.relay?.mode || "local";
+    }
+  };
+
+  const fetchDiagnostics = async () => {
+    if (!hasHost()) {
+      return;
+    }
+
+    setDiagStatus("");
+    const response = await postMessage("diag.snapshot", {});
+    if (!response.ok) {
+      setDiagStatus(response.payload?.message || "Durum bilgisi alinmadi.", "error");
+      return;
+    }
+
+    applyDiagnostics(response.payload);
+  };
+
   function openSettings() {
     if (!settingsPanel) {
       return;
@@ -262,7 +371,10 @@
     settingsPanel.classList.remove("hidden");
     setAccountStatus("");
     setSettingsStatus("");
+    setRelayStatus("");
+    setDiagStatus("");
     applySettings(loadSettings());
+    fetchDiagnostics();
     renameInput?.focus();
   }
 
@@ -274,6 +386,8 @@
     settingsPanel.classList.add("hidden");
     setAccountStatus("");
     setSettingsStatus("");
+    setRelayStatus("");
+    setDiagStatus("");
   }
 
   const clearErrors = () => {
@@ -357,6 +471,32 @@
     return `${mb.toFixed(1)} MB`;
   };
 
+  const mapDeliveryState = (state) => {
+    switch (state) {
+      case "read":
+        return { label: "Okundu", className: "read" };
+      case "delivered":
+        return { label: "Ulasti", className: "delivered" };
+      case "sent":
+        return { label: "Gonderildi", className: "sent" };
+      default:
+        return { label: "", className: "" };
+    }
+  };
+
+  const mapTransferState = (state) => {
+    switch (state) {
+      case "sending":
+        return "Gonderiliyor";
+      case "receiving":
+        return "Aliniyor";
+      case "completed":
+        return "Tamamlandi";
+      default:
+        return "";
+    }
+  };
+
   const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
   const readFileAsBase64 = (file) =>
@@ -430,6 +570,35 @@
       .toUpperCase();
   };
 
+  const canSendTyping = () =>
+    Boolean(state.activeContactId) && state.activeContactId !== "all";
+
+  const indicateTyping = (value) => {
+    if (!canSendTyping()) {
+      typingActive = false;
+      return;
+    }
+
+    if (typingActive === value) {
+      return;
+    }
+
+    typingActive = value;
+    postMessageRaw("chat.typing", {
+      threadId: state.activeContactId,
+      isTyping: value,
+    });
+  };
+
+  const scheduleTypingStop = () => {
+    if (typingTimer) {
+      clearTimeout(typingTimer);
+    }
+    typingTimer = setTimeout(() => {
+      indicateTyping(false);
+    }, 1600);
+  };
+
   const renderContacts = () => {
     if (!contactsEl) {
       return;
@@ -460,24 +629,30 @@
         const name = escapeHtml(contact.displayName);
         const preview = escapeHtml(contact.preview || "");
         const time = escapeHtml(contact.status || "");
+        const typing = Boolean(contact.isTyping);
         const initials = initialsFromName(name) || "LN";
         const active = contact.id === state.activeContactId;
         const badge = contact.unreadCount > 0
           ? `<span class=\"contact-badge\">${contact.unreadCount}</span>`
           : "";
-        const previewMarkup = preview
-          ? `<div class=\"contact-preview\">${preview}</div>`
-          : `<div class=\"contact-preview muted\">${contact.id === "all" ? "Genel sohbet" : "Henuz mesaj yok."}</div>`;
+        const previewMarkup = typing
+          ? `<div class=\"contact-preview typing\">Yaziyor...</div>`
+          : (preview
+            ? `<div class=\"contact-preview\">${preview}</div>`
+            : `<div class=\"contact-preview muted\">${contact.id === "all" ? "Genel sohbet" : "Henuz mesaj yok."}</div>`);
         const statusLabel = contact.id === "all"
           ? "Genel sohbet"
           : (time ? `Son gorulme: ${time}` : "");
         const statusMarkup = statusLabel
           ? `<div class=\"contact-status\">${escapeHtml(statusLabel)}</div>`
           : "";
+        const dot = contact.id !== "all"
+          ? `<span class=\"contact-dot ${contact.isOnline ? "is-online" : ""}\"></span>`
+          : "";
 
         return `
           <div class="contact-card" data-contact-id="${contact.id}" data-active="${active}">
-            <div class="contact-avatar">${initials}</div>
+            <div class="contact-avatar">${initials}${dot}</div>
             <div class="contact-main">
               <div class="contact-name">${name}</div>
               ${previewMarkup}
@@ -508,13 +683,33 @@
         const text = escapeHtml(message.text);
         const sender = escapeHtml(message.sender);
         const time = formatTime(message.sentAt);
-        const attachment = message.attachment
-          ? `<div class=\"attachment\">
-              <span>${escapeHtml(message.attachment.fileName)}</span>
-              <span class=\"text-[10px]\">${formatSize(message.attachment.sizeBytes)}</span>
-              <span class=\"text-[10px]\">${escapeHtml(message.attachment.status)}</span>
-            </div>`
+        const deliveryInfo = message.isMine ? mapDeliveryState(message.deliveryState) : { label: "", className: "" };
+        const deliveryMarkup = deliveryInfo.label
+          ? `<span class=\"message-status ${deliveryInfo.className}\">${deliveryInfo.label}</span>`
           : "";
+        let attachment = "";
+        if (message.attachment) {
+          const fileName = escapeHtml(message.attachment.fileName);
+          const size = formatSize(message.attachment.sizeBytes);
+          const scanStatus = message.attachment.status ? escapeHtml(message.attachment.status) : "";
+          const transferLabel = mapTransferState(message.attachment.transferState);
+          const progressValue = typeof message.attachment.progress === "number"
+            ? Math.max(0, Math.min(100, message.attachment.progress))
+            : null;
+          const progressMarkup = progressValue !== null
+            ? `<div class=\"attachment-progress\"><span style=\"width:${progressValue}%\"></span></div>`
+            : "";
+          const metaParts = [size, scanStatus, transferLabel].filter(Boolean).join(" • ");
+          const metaMarkup = metaParts ? `<div class=\"attachment-sub\">${metaParts}</div>` : "";
+          attachment = `
+            <div class=\"attachment\">
+              <div class=\"attachment-meta\">
+                <div class=\"attachment-name\">${fileName}</div>
+                ${metaMarkup}
+                ${progressMarkup}
+              </div>
+            </div>`;
+        }
 
         return `
           <div class="${mineClass}">
@@ -524,6 +719,7 @@
               ${attachment}
               <div class="message-foot">
                 <span>${time}</span>
+                ${deliveryMarkup}
               </div>
             </div>
           </div>`;
@@ -534,7 +730,7 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
 
-  const setActiveContact = (contactId) => {
+  const setActiveContact = (contactId, notify = true) => {
     state.activeContactId = contactId;
     const active = state.contacts.find((contact) => contact.id === contactId);
     if (chatTitleEl) {
@@ -545,21 +741,31 @@
         chatStatusText.textContent = "Bir sohbet sec.";
       } else if (active.id === "all") {
         chatStatusText.textContent = "Yerel agdaki herkese acik sohbet";
+      } else if (active.isTyping) {
+        chatStatusText.textContent = "Yaziyor...";
       } else if (active.status) {
         chatStatusText.textContent = `Son gorulme: ${active.status}`;
       } else {
         chatStatusText.textContent = "Durum bilgisi yok.";
       }
     }
+    if (typingIndicator) {
+      typingIndicator.classList.toggle("hidden", !active || !active.isTyping);
+    }
     if (chatAvatarEl) {
       const initials = active ? initialsFromName(active.displayName) : "LN";
       chatAvatarEl.textContent = initials || "LN";
     }
 
+    if (notify) {
+      indicateTyping(false);
+    }
     setComposerEnabled(Boolean(active));
     renderContacts();
     renderMessages();
-    postMessageRaw("chat.active", { threadId: contactId });
+    if (notify) {
+      postMessageRaw("chat.active", { threadId: contactId });
+    }
   };
 
   const applyTheme = (theme) => {
@@ -621,7 +827,7 @@
       networkCountEl.textContent = `${count} kisi`;
     }
 
-    setActiveContact(state.activeContactId);
+    setActiveContact(state.activeContactId, !typingActive);
   };
 
   const loadSnapshot = async () => {
@@ -736,6 +942,77 @@
     setSettingsStatus("Ayarlar kaydedildi.");
   };
 
+  const handleNetworkKeySave = async () => {
+    if (!networkKeyInput) {
+      return;
+    }
+
+    const value = networkKeyInput.value.trim();
+    const response = await postMessage("settings.networkKey", { networkKey: value });
+    if (!response.ok) {
+      setSettingsStatus(response.payload?.message || "Ag anahtari kaydedilemedi.", "error");
+      return;
+    }
+
+    setSettingsStatus(response.payload?.message || "Ag anahtari guncellendi.");
+  };
+
+  const handleManualPeer = async () => {
+    if (!manualPeerInput) {
+      return;
+    }
+
+    const endpoint = manualPeerInput.value.trim();
+    if (!endpoint) {
+      setRelayStatus("Manuel IP bos olamaz.", "error");
+      return;
+    }
+
+    const response = await postMessage("net.manualPeer", { endpoint });
+    if (!response.ok) {
+      setRelayStatus(response.payload?.message || "Manuel baglanti kurulamadi.", "error");
+      return;
+    }
+
+    setRelayStatus(response.payload?.message || "Manuel baglanti eklendi.");
+    manualPeerInput.value = "";
+    await loadSnapshot();
+  };
+
+  const parsePort = (value) => {
+    if (!value) {
+      return null;
+    }
+    const parsed = Number.parseInt(value, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  };
+
+  const handleRelaySave = async () => {
+    const host = relayHostInput?.value.trim() ?? "";
+    const mode = relayModeSelect?.value ?? "local";
+    const relayEnabled = Boolean(relayEnabledToggle?.checked);
+    const relayServerEnabled = Boolean(relayServerToggle?.checked);
+    const relayPort = parsePort(relayPortInput?.value);
+    const relayServerPort = parsePort(relayServerPortInput?.value);
+
+    const response = await postMessage("relay.config", {
+      host,
+      mode,
+      relayEnabled,
+      relayServerEnabled,
+      relayPort,
+      relayServerPort,
+    });
+
+    if (!response.ok) {
+      setRelayStatus(response.payload?.message || "Relay ayarlari kaydedilemedi.", "error");
+      return;
+    }
+
+    setRelayStatus(response.payload?.message || "Relay ayarlari guncellendi.");
+    fetchDiagnostics();
+  };
+
   const handleSend = async () => {
     if (!state.activeContactId) {
       setChatStatus("Sohbet secmeden mesaj gonderemezsin.", "error");
@@ -775,6 +1052,7 @@
       composeInput.value = "";
     }
 
+    indicateTyping(false);
     renderMessages();
     renderContacts();
     setChatStatus("");
@@ -960,6 +1238,24 @@
   twoFactorToggle?.addEventListener("change", () => {
     syncTwoFactorMethod();
   });
+  networkKeyButton?.addEventListener("click", handleNetworkKeySave);
+  networkKeyInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleNetworkKeySave();
+    }
+  });
+  manualPeerButton?.addEventListener("click", handleManualPeer);
+  manualPeerInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleManualPeer();
+    }
+  });
+  relaySaveButton?.addEventListener("click", handleRelaySave);
+  diagRefreshButton?.addEventListener("click", () => {
+    fetchDiagnostics();
+  });
 
   sendButton?.addEventListener("click", handleSend);
   composeInput?.addEventListener("keydown", (event) => {
@@ -967,6 +1263,19 @@
       event.preventDefault();
       handleSend();
     }
+  });
+  composeInput?.addEventListener("input", () => {
+    const value = composeInput?.value.trim() ?? "";
+    if (!value) {
+      indicateTyping(false);
+      return;
+    }
+
+    indicateTyping(true);
+    scheduleTypingStop();
+  });
+  composeInput?.addEventListener("blur", () => {
+    indicateTyping(false);
   });
 
   if (hasHost() && fileInput) {

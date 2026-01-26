@@ -13,15 +13,27 @@ namespace Local_Network_Messenger.Services
         string? ScanExecutable,
         string? ScanArguments,
         int? LanDiscoveryPort,
-        int? LanTcpPort)
+        int? LanTcpPort,
+        string? RelayHost,
+        int? RelayPort,
+        string? RelayMode,
+        bool? RelayEnabled,
+        bool? RelayServerEnabled,
+        int? RelayServerPort,
+        string[]? ManualPeers)
     {
         public string EffectiveCryptoKeyId => string.IsNullOrWhiteSpace(CryptoKeyId) ? "default" : CryptoKeyId;
         public int EffectiveDiscoveryPort => LanDiscoveryPort is > 0 ? LanDiscoveryPort.Value : 32145;
         public int EffectiveTcpPort => LanTcpPort is > 0 ? LanTcpPort.Value : 32146;
+        public int EffectiveRelayPort => RelayPort is > 0 ? RelayPort.Value : 42100;
+        public int EffectiveRelayServerPort => RelayServerPort is > 0 ? RelayServerPort.Value : 42100;
+        public string EffectiveRelayMode => string.IsNullOrWhiteSpace(RelayMode) ? "local" : RelayMode!;
+        public bool EffectiveRelayEnabled => RelayEnabled ?? false;
+        public string[] EffectiveManualPeers => ManualPeers ?? Array.Empty<string>();
 
         public static AppConfig Load(string path)
         {
-            var config = new AppConfig(null, null, null, null, null, null, null, null);
+            var config = new AppConfig(null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
             if (!File.Exists(path))
             {
                 return ResolveDefaults(config);
@@ -47,6 +59,17 @@ namespace Local_Network_Messenger.Services
             }
 
             return ResolveDefaults(config);
+        }
+
+        public static void Save(string path, AppConfig config)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                WriteIndented = true
+            };
+            var json = JsonSerializer.SerializeToUtf8Bytes(config, options);
+            File.WriteAllBytes(path, json);
         }
 
         private static AppConfig ResolveDefaults(AppConfig config)

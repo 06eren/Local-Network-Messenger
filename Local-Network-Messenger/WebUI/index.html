@@ -201,6 +201,12 @@
                 <div>
                   <h3 data-chat-title>Secili kisi yok</h3>
                   <p data-chat-status>Bir sohbet sec.</p>
+                  <div class="typing-indicator hidden" data-typing-indicator>
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                    <span class="typing-text">Yaziyor...</span>
+                  </div>
                 </div>
               </div>
             </header>
@@ -427,6 +433,110 @@
                       <option>Buyuk</option>
                     </select>
                   </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Ag Guvenligi</div>
+                <div class="settings-card">
+                  <div class="settings-item">
+                    <label class="settings-label" for="network-key-input">Ag anahtari</label>
+                    <div class="settings-row">
+                      <input id="network-key-input" class="settings-input" data-network-key placeholder="Ortak sifre" type="password" autocomplete="off" />
+                      <button class="settings-btn" type="button" data-network-key-btn>Kaydet</button>
+                    </div>
+                    <div class="settings-help">Ayni anahtari tum cihazlarda kullan.</div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Baglanti</div>
+                <div class="settings-card">
+                  <div class="settings-item">
+                    <label class="settings-label" for="manual-peer-input">Manuel IP / Port</label>
+                    <div class="settings-row">
+                      <input id="manual-peer-input" class="settings-input" data-manual-peer placeholder="192.168.1.20:32146" type="text" autocomplete="off" />
+                      <button class="settings-btn" type="button" data-manual-peer-btn>Baglan</button>
+                    </div>
+                    <div class="settings-help">Format: IP:Port (ornegin 192.168.1.20:32146)</div>
+                  </div>
+
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Relay kullan</div>
+                      <div class="settings-item-desc">Router/NAT arkasinda baglanti kur.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" data-relay-enabled />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+
+                  <div class="settings-row-line">
+                    <div class="settings-item-text">
+                      <div class="settings-item-title">Relay sunucu mod</div>
+                      <div class="settings-item-desc">Bu cihaz relay sunucusu olarak calisir.</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" data-relay-server-enabled />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+
+                  <div class="settings-item">
+                    <label class="settings-label" for="relay-host-input">Relay adresi</label>
+                    <div class="settings-grid">
+                      <input id="relay-host-input" class="settings-input" data-relay-host placeholder="relay.ornek.com" type="text" autocomplete="off" />
+                      <input id="relay-port-input" class="settings-input" data-relay-port placeholder="42100" type="number" min="1" max="65535" />
+                    </div>
+                  </div>
+
+                  <div class="settings-item">
+                    <label class="settings-label" for="relay-mode-select">Relay modu</label>
+                    <select id="relay-mode-select" class="settings-select" data-relay-mode>
+                      <option value="local">Yerel</option>
+                      <option value="relay">Relay</option>
+                    </select>
+                  </div>
+
+                  <div class="settings-item">
+                    <label class="settings-label" for="relay-server-port-input">Relay sunucu portu</label>
+                    <input id="relay-server-port-input" class="settings-input" data-relay-server-port placeholder="42100" type="number" min="1" max="65535" />
+                  </div>
+
+                  <button class="settings-secondary" type="button" data-relay-save>Relay ayarlarini uygula</button>
+                  <div class="settings-status hidden" data-relay-status></div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-title">Teshis</div>
+                <div class="settings-card">
+                  <div class="diag-grid">
+                    <div class="diag-item">
+                      <span>Firewall</span>
+                      <span class="diag-pill" data-diag-firewall>Bekleniyor</span>
+                    </div>
+                    <div class="diag-item">
+                      <span>Portlar</span>
+                      <span class="diag-pill" data-diag-ports>Bekleniyor</span>
+                    </div>
+                    <div class="diag-item">
+                      <span>C++ Sifreleme</span>
+                      <span class="diag-pill" data-diag-crypto>Bekleniyor</span>
+                    </div>
+                    <div class="diag-item">
+                      <span>Python Tarama</span>
+                      <span class="diag-pill" data-diag-scan>Bekleniyor</span>
+                    </div>
+                    <div class="diag-item">
+                      <span>Relay</span>
+                      <span class="diag-pill" data-diag-relay>Bekleniyor</span>
+                    </div>
+                  </div>
+                  <button class="settings-secondary" type="button" data-diag-refresh>Durum kontrol et</button>
+                  <div class="settings-status hidden" data-diag-status></div>
                 </div>
               </section>
 

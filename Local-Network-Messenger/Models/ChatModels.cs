@@ -9,9 +9,15 @@ namespace Local_Network_Messenger.Models
         string Status,
         string Preview,
         bool IsOnline,
-        int UnreadCount);
+        int UnreadCount,
+        bool IsTyping);
 
-    public sealed record ChatAttachmentDto(string FileName, long SizeBytes, string Status);
+    public sealed record ChatAttachmentDto(
+        string FileName,
+        long SizeBytes,
+        string Status,
+        double? Progress,
+        string? TransferState);
 
     public sealed record ChatMessageDto(
         string Id,
@@ -20,7 +26,8 @@ namespace Local_Network_Messenger.Models
         bool IsMine,
         string Text,
         DateTimeOffset SentAt,
-        ChatAttachmentDto? Attachment);
+        ChatAttachmentDto? Attachment,
+        string? DeliveryState);
 
     public sealed record ChatSnapshot(
         UserProfile CurrentUser,
@@ -35,6 +42,20 @@ namespace Local_Network_Messenger.Models
     public sealed record ChatPickFileRequest(string ThreadId);
 
     public sealed record ChatActiveRequest(string ThreadId);
+
+    public sealed record ChatTypingRequest(string ThreadId, bool IsTyping);
+
+    public sealed record NetworkKeyRequest(string NetworkKey);
+
+    public sealed record ManualPeerRequest(string Endpoint);
+
+    public sealed record RelayConfigRequest(
+        string Host,
+        string Mode,
+        bool RelayEnabled,
+        bool RelayServerEnabled,
+        int? RelayPort,
+        int? RelayServerPort);
 
     public sealed record FileScanRequest(string FileName, long SizeBytes, string? ContentType);
 

@@ -12,12 +12,17 @@ namespace Local_Network_Messenger.Services
         private static readonly Encoding TextEncoding = Encoding.UTF8;
 
         private readonly ICryptoBridge _bridge;
-        private readonly string _keyId;
+        private string _keyId;
 
         public MessageCipher(ICryptoBridge bridge, string keyId)
         {
             _bridge = bridge;
             _keyId = keyId;
+        }
+
+        public void UpdateKeyId(string keyId)
+        {
+            _keyId = string.IsNullOrWhiteSpace(keyId) ? "default" : keyId;
         }
 
         public async Task<string> EncryptAsync(string plainText, CancellationToken cancellationToken)
