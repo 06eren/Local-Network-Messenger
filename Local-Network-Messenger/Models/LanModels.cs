@@ -8,6 +8,8 @@ namespace Local_Network_Messenger.Models
         public const string ChatAck = "chat.ack";
         public const string ChatRead = "chat.read";
         public const string ChatTyping = "chat.typing";
+        public const string ChatEdit = "chat.edit";
+        public const string ChatDelete = "chat.delete";
         public const string PeerHello = "peer.hello";
         public const string PeerHelloAck = "peer.hello.ack";
         public const string PeerOffline = "peer.offline";
@@ -67,6 +69,23 @@ namespace Local_Network_Messenger.Models
         string To,
         string ThreadId,
         bool IsTyping);
+
+    public sealed record LanChatEdit(
+        string MessageId,
+        string From,
+        string FromDisplayName,
+        string To,
+        string ThreadId,
+        string CipherText,
+        long EditedAt);
+
+    public sealed record LanChatDelete(
+        string MessageId,
+        string From,
+        string FromDisplayName,
+        string To,
+        string ThreadId,
+        long DeletedAt);
 
     public sealed record LanFileStart(
         string FileId,

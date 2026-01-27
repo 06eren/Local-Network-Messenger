@@ -67,6 +67,54 @@ namespace Local_Network_Messenger.Services
             return new FileScanResult("unknown", "Tarama servisi kapali.", null);
         }
 
+        public async Task<NetworkAnalysisResult> AnalyzeNetworkAsync(NetworkAnalysisRequest request, CancellationToken cancellationToken)
+        {
+            if (_disposed)
+            {
+                return new NetworkAnalysisResult("unknown", "Tarama servisi kapali.", null);
+            }
+
+            for (var attempt = 0; attempt < 2; attempt += 1)
+            {
+                try
+                {
+                    var client = await GetClientAsync(cancellationToken);
+                    var response = await client.SendAsync<NetworkAnalysisIpcRequest, NetworkAnalysisIpcResponse>(
+                        IpcMessageTypes.NetworkAnalysisRequest,
+                        new NetworkAnalysisIpcRequest(request.PeerCount, request.AveragePingMs, request.LossPercent),
+                        cancellationToken);
+
+                    if (response.Payload.Error != null)
+                    {
+                        return new NetworkAnalysisResult(
+                            "error",
+                            response.Payload.Error.Message,
+                            response.Payload.Details);
+                    }
+
+                    var status = string.IsNullOrWhiteSpace(response.Payload.Status)
+                        ? "unknown"
+                        : response.Payload.Status;
+                    var details = response.Payload.Details;
+                    return new NetworkAnalysisResult(status, "Ag analizi tamamlandi.", details);
+                }
+                catch (Exception ex)
+                {
+                    if (attempt == 0 && await RestartClientAsync())
+                    {
+                        continue;
+                    }
+
+                    return new NetworkAnalysisResult(
+                        "unknown",
+                        "Ag analizi servisi kapali.",
+                        ex.Message);
+                }
+            }
+
+            return new NetworkAnalysisResult("unknown", "Ag analizi servisi kapali.", null);
+        }
+
         private async Task<ProcessJsonClient> GetClientAsync(CancellationToken cancellationToken)
         {
             await _clientLock.WaitAsync(cancellationToken);

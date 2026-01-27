@@ -32,7 +32,9 @@ namespace Local_Network_Messenger.Models
         string Text,
         DateTimeOffset SentAt,
         ChatAttachmentDto? Attachment,
-        string? DeliveryState);
+        string? DeliveryState,
+        bool IsEdited,
+        bool IsDeleted);
 
     public sealed record ChatSnapshot(
         UserProfile CurrentUser,
@@ -41,6 +43,10 @@ namespace Local_Network_Messenger.Models
         string ActiveContactId);
 
     public sealed record ChatSendRequest(string ThreadId, string Text);
+
+    public sealed record ChatEditRequest(string MessageId, string ThreadId, string Text);
+
+    public sealed record ChatDeleteRequest(string MessageId, string ThreadId);
 
     public sealed record ChatAttachRequest(string ThreadId, string FileName, long SizeBytes, string? ContentType, string? DataBase64);
 
@@ -67,6 +73,12 @@ namespace Local_Network_Messenger.Models
         bool RelayServerEnabled,
         int? RelayPort,
         int? RelayServerPort);
+
+    public sealed record NetworkAnalysisRequest(int PeerCount, double? AveragePingMs, double? LossPercent);
+
+    public sealed record NetworkAnalysisResult(string Status, string Message, string? Details);
+
+    public sealed record NetworkQualitySummary(int PeerCount, double? AveragePingMs, double? LossPercent);
 
     public sealed record FileScanRequest(string FileName, long SizeBytes, string? ContentType);
 

@@ -44,6 +44,25 @@ namespace Local_Network_Messenger.Services
             return $"{CipherPrefix}{payload}";
         }
 
+        public async Task<string> EncryptBase64PayloadAsync(string base64Payload, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(base64Payload))
+            {
+                return string.Empty;
+            }
+
+            var normalized = NormalizeBase64(base64Payload);
+            var result = await _bridge.EncryptAsync(new CryptoRequest(_keyId, normalized), cancellationToken);
+            if (!string.Equals(result.Status, "ok", StringComparison.OrdinalIgnoreCase))
+            {
+                return $"{PlainPrefix}{normalized}";
+            }
+
+            var payload = string.IsNullOrWhiteSpace(result.PayloadBase64) ? normalized : result.PayloadBase64;
+            payload = NormalizeBase64(payload);
+            return $"{CipherPrefix}{payload}";
+        }
+
         public async Task<string> DecryptAsync(string payload, CancellationToken cancellationToken)
         {
             if (string.IsNullOrEmpty(payload))
@@ -72,6 +91,34 @@ namespace Local_Network_Messenger.Services
             }
 
             return payload;
+        }
+
+        public async Task<string> DecryptToBase64Async(string payload, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(payload))
+            {
+                return string.Empty;
+            }
+
+            if (payload.StartsWith(PlainPrefix, StringComparison.Ordinal))
+            {
+                return NormalizeBase64(payload.Substring(PlainPrefix.Length));
+            }
+
+            if (payload.StartsWith(CipherPrefix, StringComparison.Ordinal))
+            {
+                var base64 = NormalizeBase64(payload.Substring(CipherPrefix.Length));
+                var result = await _bridge.DecryptAsync(new CryptoRequest(_keyId, base64), cancellationToken);
+                if (!string.Equals(result.Status, "ok", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "!";
+                }
+
+                var resolved = string.IsNullOrWhiteSpace(result.PayloadBase64) ? base64 : result.PayloadBase64;
+                return NormalizeBase64(resolved);
+            }
+
+            return NormalizeBase64(payload);
         }
 
         private static string DecodeBase64OrFallback(string base64, string fallback)

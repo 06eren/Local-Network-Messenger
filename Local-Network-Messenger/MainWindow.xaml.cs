@@ -79,6 +79,8 @@ namespace Local_Network_Messenger
             _chatService.MessageReceived += OnMessageReceived;
             _lanService.PeerChanged += OnPeerChanged;
             _lanService.MessageReceived += OnLanMessageReceived;
+            _lanService.ChatEditReceived += OnLanChatEditReceived;
+            _lanService.ChatDeleteReceived += OnLanChatDeleteReceived;
             _lanService.FileReceived += OnLanFileReceived;
             _lanService.ChatAckReceived += OnLanChatAckReceived;
             _lanService.ChatReadReceived += OnLanChatReadReceived;
@@ -232,7 +234,7 @@ namespace Local_Network_Messenger
                     FileName = config.CryptoExecutable,
                     Arguments = config.CryptoArguments ?? string.Empty
                 };
-                _cryptoClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(6));
+                _cryptoClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(20));
                 return new CryptoProcessBridge(_cryptoClient);
             }
             catch (Exception ex)
@@ -281,7 +283,7 @@ namespace Local_Network_Messenger
                     startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
                     startInfo.Environment["PYTHONUTF8"] = "1";
                     startInfo.Environment["PYTHONUNBUFFERED"] = "1";
-                    return new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(8));
+                    return new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(20));
                 }
 
                 var client = BuildClient();
@@ -347,6 +349,8 @@ namespace Local_Network_Messenger
             _chatService.MessageReceived -= OnMessageReceived;
             _lanService.PeerChanged -= OnPeerChanged;
             _lanService.MessageReceived -= OnLanMessageReceived;
+            _lanService.ChatEditReceived -= OnLanChatEditReceived;
+            _lanService.ChatDeleteReceived -= OnLanChatDeleteReceived;
             _lanService.FileReceived -= OnLanFileReceived;
             _lanService.ChatAckReceived -= OnLanChatAckReceived;
             _lanService.ChatReadReceived -= OnLanChatReadReceived;
@@ -473,13 +477,40 @@ namespace Local_Network_Messenger
                     e.ThreadId,
                     e.FromDisplayName,
                     e.Text,
-                    CancellationToken.None);
+                    CancellationToken.None,
+                    e.MessageId);
                 if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
                 {
                     _chatService.MarkThreadAsRead(e.ThreadId);
                     _ = _lanService.SendReadReceiptAsync(e.ThreadId, e.ThreadId, CancellationToken.None);
                 }
                 await ApplySentimentThemeAsync(e.Text);
+                ScheduleSnapshotPush();
+            });
+        }
+
+        private void OnLanChatEditReceived(object? sender, LanChatEditReceivedEventArgs e)
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await _chatService.EditMessageAsync(e.MessageId, e.Text, false, CancellationToken.None);
+                if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _chatService.MarkThreadAsRead(e.ThreadId);
+                }
+                ScheduleSnapshotPush();
+            });
+        }
+
+        private void OnLanChatDeleteReceived(object? sender, LanChatDeleteReceivedEventArgs e)
+        {
+            Dispatcher.InvokeAsync(async () =>
+            {
+                await _chatService.DeleteMessageAsync(e.MessageId, false, CancellationToken.None);
+                if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
+                {
+                    _chatService.MarkThreadAsRead(e.ThreadId);
+                }
                 ScheduleSnapshotPush();
             });
         }
@@ -883,6 +914,13 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendMessageAsync(threadId, text, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    await Task.Delay(150);
+                    await _lanService.AnnouncePresenceAsync(CancellationToken.None);
+                    var retry = await _lanService.SendMessageAsync(threadId, text, messageId, CancellationToken.None);
+                    if (retry.Success)
+                    {
+                        return;
+                    }
                     ClearDeliveryTimeout(messageId);
                     _chatService.UpdateDeliveryState(messageId, "failed");
                     ScheduleSnapshotPush();
@@ -905,6 +943,13 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendFileAsync(threadId, fileName, data, contentType, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    await Task.Delay(200);
+                    await _lanService.AnnouncePresenceAsync(CancellationToken.None);
+                    var retry = await _lanService.SendFileAsync(threadId, fileName, data, contentType, messageId, CancellationToken.None);
+                    if (retry.Success)
+                    {
+                        return;
+                    }
                     _chatService.UpdateFileStatus(messageId, "error");
                     _chatService.UpdateFileProgress(messageId, 0, "failed");
                     ScheduleSnapshotPush();
@@ -927,6 +972,13 @@ namespace Local_Network_Messenger
                 var result = await _lanService.SendFileFromPathAsync(threadId, filePath, contentType, messageId, CancellationToken.None);
                 if (!result.Success)
                 {
+                    await Task.Delay(200);
+                    await _lanService.AnnouncePresenceAsync(CancellationToken.None);
+                    var retry = await _lanService.SendFileFromPathAsync(threadId, filePath, contentType, messageId, CancellationToken.None);
+                    if (retry.Success)
+                    {
+                        return;
+                    }
                     _chatService.UpdateFileStatus(messageId, "error");
                     _chatService.UpdateFileProgress(messageId, 0, "failed");
                     ScheduleSnapshotPush();
@@ -1133,7 +1185,7 @@ namespace Local_Network_Messenger
                 CancellationToken.None);
         }
 
-        private object BuildDiagnosticsSnapshot()
+        private async Task<object> BuildDiagnosticsSnapshotAsync()
         {
             var cryptoMode = _cryptoBridge switch
             {
@@ -1149,6 +1201,9 @@ namespace Local_Network_Messenger
                 FileScanProcessService => "process",
                 _ => "basic"
             };
+
+            var quality = _chatService.GetNetworkQualitySummary();
+            var analysis = await BuildNetworkAnalysisAsync(quality);
 
             return new
             {
@@ -1183,8 +1238,100 @@ namespace Local_Network_Messenger
                     serverPort = _config.EffectiveRelayServerPort,
                     connected = _lanService.IsRelayConnected
                 },
+                network = new
+                {
+                    peers = quality.PeerCount,
+                    averagePingMs = quality.AveragePingMs,
+                    lossPercent = quality.LossPercent
+                },
+                networkAnalysis = new
+                {
+                    status = analysis.Result.Status,
+                    details = analysis.Result.Details,
+                    message = analysis.Result.Message,
+                    source = analysis.Source
+                },
                 manualPeers = _lanService.ManualPeerCount
             };
+        }
+
+        private async Task<(NetworkAnalysisResult Result, string Source)> BuildNetworkAnalysisAsync(NetworkQualitySummary summary)
+        {
+            if (_fileScanService is FileScanProcessService process)
+            {
+                var request = new NetworkAnalysisRequest(summary.PeerCount, summary.AveragePingMs, summary.LossPercent);
+                var result = await process.AnalyzeNetworkAsync(request, CancellationToken.None);
+                if (!string.Equals(result.Status, "unknown", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(result.Status, "error", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (result, "python");
+                }
+
+                if (!string.IsNullOrWhiteSpace(result.Details) &&
+                    result.Details.Contains("IPC", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (BuildLocalNetworkAnalysis(summary), "local");
+                }
+
+                if (!string.IsNullOrWhiteSpace(result.Message) &&
+                    result.Message.Contains("servisi kapali", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (BuildLocalNetworkAnalysis(summary), "local");
+                }
+
+                return (result, "python");
+            }
+
+            return (BuildLocalNetworkAnalysis(summary), "local");
+        }
+
+        private static NetworkAnalysisResult BuildLocalNetworkAnalysis(NetworkQualitySummary summary)
+        {
+            if (summary.PeerCount <= 0)
+            {
+                return new NetworkAnalysisResult("bekleniyor", "Agda aktif cihaz yok.", null);
+            }
+
+            var ping = summary.AveragePingMs ?? 0;
+            var loss = summary.LossPercent ?? 0;
+            var score = 100d;
+            if (ping > 180)
+            {
+                score -= 45;
+            }
+            else if (ping > 90)
+            {
+                score -= 25;
+            }
+            else if (ping > 50)
+            {
+                score -= 10;
+            }
+
+            if (loss > 12)
+            {
+                score -= 50;
+            }
+            else if (loss > 5)
+            {
+                score -= 25;
+            }
+            else if (loss > 2)
+            {
+                score -= 10;
+            }
+
+            if (score >= 80)
+            {
+                return new NetworkAnalysisResult("iyi", "Ag stabil.", null);
+            }
+
+            if (score >= 55)
+            {
+                return new NetworkAnalysisResult("orta", "Ag kullanilabilir.", null);
+            }
+
+            return new NetworkAnalysisResult("zayif", "Agda kayip/gecikme yuksek.", null);
         }
 
         private async Task<IReadOnlyList<SecurityLogEntry>> ReadSecurityLogsAsync(int limit)
@@ -1624,6 +1771,70 @@ namespace Local_Network_Messenger
                     _ = ApplySentimentThemeAsync(request.Text.Trim());
                     return;
                 }
+                case "chat.edit":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ChatEditRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.MessageId) || string.IsNullOrWhiteSpace(request.ThreadId))
+                    {
+                        await SendErrorAsync(message, "Duzenleme verisi okunamadi.");
+                        return;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(request.Text))
+                    {
+                        await SendErrorAsync(message, "Bos mesaj duzenlenemez.");
+                        return;
+                    }
+
+                    var updated = await _chatService.EditMessageAsync(
+                        request.MessageId,
+                        request.Text.Trim(),
+                        true,
+                        CancellationToken.None);
+                    if (!updated)
+                    {
+                        await SendErrorAsync(message, "Mesaj duzenlenemedi.");
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "chat.edit", true, new { message = "Mesaj duzenlendi." }, null);
+                    ScheduleSnapshotPush();
+                    _ = _lanService.SendChatEditAsync(request.ThreadId, request.ThreadId, request.MessageId, request.Text.Trim(), CancellationToken.None);
+                    return;
+                }
+                case "chat.delete":
+                {
+                    if (!_sessionState.IsAuthenticated)
+                    {
+                        await SendErrorAsync(message, "Oturum bulunamadi.");
+                        return;
+                    }
+
+                    var request = DeserializePayload<ChatDeleteRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.MessageId) || string.IsNullOrWhiteSpace(request.ThreadId))
+                    {
+                        await SendErrorAsync(message, "Silme verisi okunamadi.");
+                        return;
+                    }
+
+                    var deleted = await _chatService.DeleteMessageAsync(request.MessageId, true, CancellationToken.None);
+                    if (!deleted)
+                    {
+                        await SendErrorAsync(message, "Mesaj silinemedi.");
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "chat.delete", true, new { message = "Mesaj silindi." }, null);
+                    ScheduleSnapshotPush();
+                    _ = _lanService.SendChatDeleteAsync(request.ThreadId, request.ThreadId, request.MessageId, CancellationToken.None);
+                    return;
+                }
                 case "settings.networkKey":
                 {
                     var request = DeserializePayload<NetworkKeyRequest>(message.Payload);
@@ -1711,7 +1922,7 @@ namespace Local_Network_Messenger
                 }
                 case "diag.snapshot":
                 {
-                    var payload = BuildDiagnosticsSnapshot();
+                    var payload = await BuildDiagnosticsSnapshotAsync();
                     await SendResponseAsync(message, "diag.snapshot", true, payload, null);
                     return;
                 }

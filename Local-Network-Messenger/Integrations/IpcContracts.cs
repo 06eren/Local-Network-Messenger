@@ -6,6 +6,8 @@ namespace Local_Network_Messenger.Integrations
         public const string CryptoResponse = "crypto.response";
         public const string FileScanRequest = "scan.request";
         public const string FileScanResponse = "scan.response";
+        public const string NetworkAnalysisRequest = "net.analysis.request";
+        public const string NetworkAnalysisResponse = "net.analysis.response";
     }
 
     public sealed record IpcEnvelope<T>(string Id, string Type, T Payload);
@@ -19,4 +21,8 @@ namespace Local_Network_Messenger.Integrations
     public sealed record FileScanIpcRequest(string FileName, long SizeBytes, string? Sha256Base64);
 
     public sealed record FileScanIpcResponse(string Status, string? Details, IpcError? Error);
+
+    public sealed record NetworkAnalysisIpcRequest(int PeerCount, double? AveragePingMs, double? LossPercent);
+
+    public sealed record NetworkAnalysisIpcResponse(string Status, string? Details, IpcError? Error);
 }

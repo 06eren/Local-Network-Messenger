@@ -16,6 +16,8 @@ namespace Local_Network_Messenger.Services
         string TextCipher,
         DateTimeOffset SentAt,
         string? DeliveryState,
+        bool IsEdited,
+        bool IsDeleted,
         string? AttachmentFileNameCipher,
         long? AttachmentSizeBytes,
         string? AttachmentStatus,
@@ -88,6 +90,8 @@ namespace Local_Network_Messenger.Services
                     TextCipher TEXT NOT NULL,
                     SentAt INTEGER NOT NULL,
                     DeliveryState TEXT NULL,
+                    IsEdited INTEGER NULL,
+                    IsDeleted INTEGER NULL,
                     AttachmentFileNameCipher TEXT NULL,
                     AttachmentSizeBytes INTEGER NULL,
                     AttachmentStatus TEXT NULL,
@@ -98,6 +102,34 @@ namespace Local_Network_Messenger.Services
                 CREATE INDEX IF NOT EXISTS IX_Messages_Thread ON Messages (Owner, ThreadId, SentAt);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
+            await EnsureColumnsAsync(connection, cancellationToken);
+        }
+
+        private static async Task EnsureColumnsAsync(SqliteConnection connection, CancellationToken cancellationToken)
+        {
+            var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            await using var pragma = connection.CreateCommand();
+            pragma.CommandText = "PRAGMA table_info(Messages);";
+            await using var reader = await pragma.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var name = reader.GetString(1);
+                existing.Add(name);
+            }
+
+            if (!existing.Contains("IsEdited"))
+            {
+                await using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE Messages ADD COLUMN IsEdited INTEGER NULL;";
+                await alter.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            if (!existing.Contains("IsDeleted"))
+            {
+                await using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE Messages ADD COLUMN IsDeleted INTEGER NULL;";
+                await alter.ExecuteNonQueryAsync(cancellationToken);
+            }
         }
 
         public async Task<IReadOnlyList<ChatArchiveRecord>> LoadRecentAsync(string owner, int limit, CancellationToken cancellationToken)
@@ -108,7 +140,7 @@ namespace Local_Network_Messenger.Services
             await using var command = connection.CreateCommand();
             command.CommandText = """
                 SELECT Id, Owner, ThreadId, Sender, IsMine, TextCipher, SentAt, DeliveryState,
-                       AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
+                       IsEdited, IsDeleted, AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
                 FROM Messages
                 WHERE Owner = $owner
                 ORDER BY SentAt ASC
@@ -120,11 +152,13 @@ namespace Local_Network_Messenger.Services
             while (await reader.ReadAsync(cancellationToken))
             {
                 var sentAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(6));
-                var attachmentFileName = reader.IsDBNull(8) ? null : reader.GetString(8);
-                long? attachmentSize = reader.IsDBNull(9) ? null : reader.GetInt64(9);
-                var attachmentStatus = reader.IsDBNull(10) ? null : reader.GetString(10);
-                double? attachmentProgress = reader.IsDBNull(11) ? null : reader.GetDouble(11);
-                var attachmentTransferState = reader.IsDBNull(12) ? null : reader.GetString(12);
+                var isEdited = !reader.IsDBNull(8) && reader.GetInt32(8) == 1;
+                var isDeleted = !reader.IsDBNull(9) && reader.GetInt32(9) == 1;
+                var attachmentFileName = reader.IsDBNull(10) ? null : reader.GetString(10);
+                long? attachmentSize = reader.IsDBNull(11) ? null : reader.GetInt64(11);
+                var attachmentStatus = reader.IsDBNull(12) ? null : reader.GetString(12);
+                double? attachmentProgress = reader.IsDBNull(13) ? null : reader.GetDouble(13);
+                var attachmentTransferState = reader.IsDBNull(14) ? null : reader.GetString(14);
                 results.Add(new ChatArchiveRecord(
                     reader.GetString(0),
                     reader.GetString(1),
@@ -134,6 +168,8 @@ namespace Local_Network_Messenger.Services
                     reader.GetString(5),
                     sentAt,
                     reader.IsDBNull(7) ? null : reader.GetString(7),
+                    isEdited,
+                    isDeleted,
                     attachmentFileName,
                     attachmentSize,
                     attachmentStatus,
@@ -155,7 +191,7 @@ namespace Local_Network_Messenger.Services
             await using var command = connection.CreateCommand();
             command.CommandText = """
                 SELECT Id, Owner, ThreadId, Sender, IsMine, TextCipher, SentAt, DeliveryState,
-                       AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
+                       IsEdited, IsDeleted, AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
                 FROM Messages
                 WHERE Owner = $owner
                   AND ($since IS NULL OR SentAt >= $since)
@@ -167,11 +203,13 @@ namespace Local_Network_Messenger.Services
             while (await reader.ReadAsync(cancellationToken))
             {
                 var sentAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.GetInt64(6));
-                var attachmentFileName = reader.IsDBNull(8) ? null : reader.GetString(8);
-                long? attachmentSize = reader.IsDBNull(9) ? null : reader.GetInt64(9);
-                var attachmentStatus = reader.IsDBNull(10) ? null : reader.GetString(10);
-                double? attachmentProgress = reader.IsDBNull(11) ? null : reader.GetDouble(11);
-                var attachmentTransferState = reader.IsDBNull(12) ? null : reader.GetString(12);
+                var isEdited = !reader.IsDBNull(8) && reader.GetInt32(8) == 1;
+                var isDeleted = !reader.IsDBNull(9) && reader.GetInt32(9) == 1;
+                var attachmentFileName = reader.IsDBNull(10) ? null : reader.GetString(10);
+                long? attachmentSize = reader.IsDBNull(11) ? null : reader.GetInt64(11);
+                var attachmentStatus = reader.IsDBNull(12) ? null : reader.GetString(12);
+                double? attachmentProgress = reader.IsDBNull(13) ? null : reader.GetDouble(13);
+                var attachmentTransferState = reader.IsDBNull(14) ? null : reader.GetString(14);
                 results.Add(new ChatArchiveRecord(
                     reader.GetString(0),
                     reader.GetString(1),
@@ -181,6 +219,8 @@ namespace Local_Network_Messenger.Services
                     reader.GetString(5),
                     sentAt,
                     reader.IsDBNull(7) ? null : reader.GetString(7),
+                    isEdited,
+                    isDeleted,
                     attachmentFileName,
                     attachmentSize,
                     attachmentStatus,
@@ -199,11 +239,11 @@ namespace Local_Network_Messenger.Services
             command.CommandText = """
                 INSERT INTO Messages (
                     Id, Owner, ThreadId, Sender, IsMine, TextCipher, SentAt, DeliveryState,
-                    AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
+                    IsEdited, IsDeleted, AttachmentFileNameCipher, AttachmentSizeBytes, AttachmentStatus, AttachmentProgress, AttachmentTransferState
                 )
                 VALUES (
                     $id, $owner, $threadId, $sender, $isMine, $textCipher, $sentAt, $deliveryState,
-                    $fileNameCipher, $fileSize, $fileStatus, $fileProgress, $fileTransfer
+                    $isEdited, $isDeleted, $fileNameCipher, $fileSize, $fileStatus, $fileProgress, $fileTransfer
                 )
                 ON CONFLICT(Id) DO UPDATE SET
                     Owner = excluded.Owner,
@@ -213,6 +253,8 @@ namespace Local_Network_Messenger.Services
                     TextCipher = excluded.TextCipher,
                     SentAt = excluded.SentAt,
                     DeliveryState = excluded.DeliveryState,
+                    IsEdited = excluded.IsEdited,
+                    IsDeleted = excluded.IsDeleted,
                     AttachmentFileNameCipher = excluded.AttachmentFileNameCipher,
                     AttachmentSizeBytes = excluded.AttachmentSizeBytes,
                     AttachmentStatus = excluded.AttachmentStatus,
@@ -227,6 +269,8 @@ namespace Local_Network_Messenger.Services
             command.Parameters.AddWithValue("$textCipher", record.TextCipher);
             command.Parameters.AddWithValue("$sentAt", record.SentAt.ToUnixTimeMilliseconds());
             command.Parameters.AddWithValue("$deliveryState", (object?)record.DeliveryState ?? DBNull.Value);
+            command.Parameters.AddWithValue("$isEdited", record.IsEdited ? 1 : 0);
+            command.Parameters.AddWithValue("$isDeleted", record.IsDeleted ? 1 : 0);
             command.Parameters.AddWithValue("$fileNameCipher", (object?)record.AttachmentFileNameCipher ?? DBNull.Value);
             command.Parameters.AddWithValue("$fileSize", (object?)record.AttachmentSizeBytes ?? DBNull.Value);
             command.Parameters.AddWithValue("$fileStatus", (object?)record.AttachmentStatus ?? DBNull.Value);

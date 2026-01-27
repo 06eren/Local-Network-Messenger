@@ -35,18 +35,50 @@ namespace Local_Network_Messenger.Services
 
     public sealed class LanMessageReceivedEventArgs : EventArgs
     {
-        public LanMessageReceivedEventArgs(string from, string fromDisplayName, string threadId, string text)
+        public LanMessageReceivedEventArgs(string messageId, string from, string fromDisplayName, string threadId, string text)
         {
+            MessageId = messageId;
             From = from;
             FromDisplayName = fromDisplayName;
             ThreadId = threadId;
             Text = text;
         }
 
+        public string MessageId { get; }
         public string From { get; }
         public string FromDisplayName { get; }
         public string ThreadId { get; }
         public string Text { get; }
+    }
+
+    public sealed class LanChatEditReceivedEventArgs : EventArgs
+    {
+        public LanChatEditReceivedEventArgs(string messageId, string from, string threadId, string text)
+        {
+            MessageId = messageId;
+            From = from;
+            ThreadId = threadId;
+            Text = text;
+        }
+
+        public string MessageId { get; }
+        public string From { get; }
+        public string ThreadId { get; }
+        public string Text { get; }
+    }
+
+    public sealed class LanChatDeleteReceivedEventArgs : EventArgs
+    {
+        public LanChatDeleteReceivedEventArgs(string messageId, string from, string threadId)
+        {
+            MessageId = messageId;
+            From = from;
+            ThreadId = threadId;
+        }
+
+        public string MessageId { get; }
+        public string From { get; }
+        public string ThreadId { get; }
     }
 
     public sealed class LanFileReceivedEventArgs : EventArgs
@@ -180,7 +212,7 @@ namespace Local_Network_Messenger.Services
 
     public sealed class LanTransportService : IAsyncDisposable
     {
-        private const int ChunkSize = 64 * 1024;
+        private const int ChunkSize = 256 * 1024;
         private static readonly TimeSpan PresenceInterval = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan PresenceTimeout = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(5);
@@ -237,6 +269,8 @@ namespace Local_Network_Messenger.Services
 
         public event EventHandler<PeerChangedEventArgs>? PeerChanged;
         public event EventHandler<LanMessageReceivedEventArgs>? MessageReceived;
+        public event EventHandler<LanChatEditReceivedEventArgs>? ChatEditReceived;
+        public event EventHandler<LanChatDeleteReceivedEventArgs>? ChatDeleteReceived;
         public event EventHandler<LanFileReceivedEventArgs>? FileReceived;
         public event EventHandler<LanChatAckReceivedEventArgs>? ChatAckReceived;
         public event EventHandler<LanChatReadReceivedEventArgs>? ChatReadReceived;
@@ -426,7 +460,12 @@ namespace Local_Network_Messenger.Services
                 return await BroadcastMessageAsync(text, cancellationToken);
             }
 
-            if (!_peers.TryGetValue(targetUser, out var peer) || !peer.IsOnline)
+            if (!_peers.TryGetValue(targetUser, out var peer))
+            {
+                return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
+            }
+
+            if (!peer.IsOnline && DateTimeOffset.UtcNow - peer.LastSeen > TimeSpan.FromMinutes(2))
             {
                 return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
             }
@@ -975,6 +1014,12 @@ namespace Local_Network_Messenger.Services
                 case LanPacketTypes.ChatTyping:
                     await HandleChatTypingAsync(packet.Payload, cancellationToken);
                     break;
+                case LanPacketTypes.ChatEdit:
+                    await HandleChatEditAsync(packet.Payload, null, true, cancellationToken);
+                    break;
+                case LanPacketTypes.ChatDelete:
+                    await HandleChatDeleteAsync(packet.Payload, null, true, cancellationToken);
+                    break;
                 case LanPacketTypes.FileStart:
                     await HandleFileStartAsync(packet.Payload, null, true, cancellationToken);
                     break;
@@ -1055,7 +1100,7 @@ namespace Local_Network_Messenger.Services
             {
                 sentBytes += read;
                 var base64 = Convert.ToBase64String(buffer, 0, read);
-                var cipher = await _cipher.EncryptAsync(base64, cancellationToken);
+                var cipher = await _cipher.EncryptBase64PayloadAsync(base64, cancellationToken);
                 var isLast = sentBytes >= sizeBytes;
                 var chunkPayload = new LanFileChunk(fileId, index, cipher, isLast);
                 await SendRelayPacketAsync(LanPacketTypes.FileChunk, targetUser, chunkPayload, cancellationToken);
@@ -1381,6 +1426,12 @@ namespace Local_Network_Messenger.Services
                     case LanPacketTypes.ChatTyping:
                         await HandleChatTypingAsync(packet.Payload, cancellationToken);
                         break;
+                    case LanPacketTypes.ChatEdit:
+                        await HandleChatEditAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
+                        break;
+                    case LanPacketTypes.ChatDelete:
+                        await HandleChatDeleteAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
+                        break;
                     case LanPacketTypes.FileStart:
                         await HandleFileStartAsync(packet.Payload, remoteEndPoint, false, cancellationToken);
                         break;
@@ -1433,7 +1484,7 @@ namespace Local_Network_Messenger.Services
                 ? "all"
                 : message.From;
             var text = await _cipher.DecryptAsync(message.CipherText, cancellationToken);
-            MessageReceived?.Invoke(this, new LanMessageReceivedEventArgs(message.From, message.FromDisplayName, threadId, text));
+            MessageReceived?.Invoke(this, new LanMessageReceivedEventArgs(message.MessageId, message.From, message.FromDisplayName, threadId, text));
 
             if (!string.Equals(message.To, "all", StringComparison.OrdinalIgnoreCase))
             {
@@ -1516,6 +1567,82 @@ namespace Local_Network_Messenger.Services
             }
 
             TypingReceived?.Invoke(this, new LanTypingReceivedEventArgs(typing.ThreadId, typing.From, typing.IsTyping));
+            await Task.CompletedTask;
+        }
+
+        private async Task HandleChatEditAsync(JsonElement payload, IPEndPoint? remoteEndPoint, bool viaRelay, CancellationToken cancellationToken)
+        {
+            LanChatEdit? edit;
+            try
+            {
+                edit = payload.Deserialize<LanChatEdit>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (edit == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(edit.To))
+            {
+                return;
+            }
+
+            if (!viaRelay)
+            {
+                UpsertPeer(edit.From, edit.FromDisplayName, remoteEndPoint, 0, "local");
+            }
+            else
+            {
+                UpsertPeer(edit.From, edit.FromDisplayName, _relayServerEndPoint, _listenPort, "relay");
+            }
+
+            var threadId = string.Equals(edit.To, "all", StringComparison.OrdinalIgnoreCase)
+                ? "all"
+                : edit.From;
+            var text = await _cipher.DecryptAsync(edit.CipherText, cancellationToken);
+            ChatEditReceived?.Invoke(this, new LanChatEditReceivedEventArgs(edit.MessageId, edit.From, threadId, text));
+        }
+
+        private async Task HandleChatDeleteAsync(JsonElement payload, IPEndPoint? remoteEndPoint, bool viaRelay, CancellationToken cancellationToken)
+        {
+            LanChatDelete? deleted;
+            try
+            {
+                deleted = payload.Deserialize<LanChatDelete>(_jsonOptions);
+            }
+            catch (JsonException)
+            {
+                return;
+            }
+
+            if (deleted == null)
+            {
+                return;
+            }
+
+            if (!IsMessageForLocalUser(deleted.To))
+            {
+                return;
+            }
+
+            if (!viaRelay)
+            {
+                UpsertPeer(deleted.From, deleted.FromDisplayName, remoteEndPoint, 0, "local");
+            }
+            else
+            {
+                UpsertPeer(deleted.From, deleted.FromDisplayName, _relayServerEndPoint, _listenPort, "relay");
+            }
+
+            var threadId = string.Equals(deleted.To, "all", StringComparison.OrdinalIgnoreCase)
+                ? "all"
+                : deleted.From;
+            ChatDeleteReceived?.Invoke(this, new LanChatDeleteReceivedEventArgs(deleted.MessageId, deleted.From, threadId));
             await Task.CompletedTask;
         }
 
@@ -1779,7 +1906,7 @@ namespace Local_Network_Messenger.Services
                 return;
             }
 
-            var base64 = await _cipher.DecryptAsync(chunk.DataCipher, cancellationToken);
+            var base64 = await _cipher.DecryptToBase64Async(chunk.DataCipher, cancellationToken);
             byte[] bytes;
             try
             {
@@ -2044,6 +2171,90 @@ namespace Local_Network_Messenger.Services
             }
 
             await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatTyping, payload, cancellationToken);
+        }
+
+        public async Task<bool> SendChatEditAsync(string targetUser, string threadId, string messageId, string newText, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return false;
+            }
+
+            var cipherText = await _cipher.EncryptAsync(newText, cancellationToken);
+            var payload = new LanChatEdit(
+                messageId,
+                _user.Username,
+                _user.DisplayName,
+                targetUser,
+                threadId,
+                cipherText,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+            if (string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                if (UseRelayForAll())
+                {
+                    await SendRelayPacketAsync(LanPacketTypes.ChatEdit, "all", payload, cancellationToken);
+                    return true;
+                }
+
+                return await BroadcastPacketAsync(LanPacketTypes.ChatEdit, payload, cancellationToken);
+            }
+
+            if (!_peers.TryGetValue(targetUser, out var peer))
+            {
+                return false;
+            }
+
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                await SendRelayPacketAsync(LanPacketTypes.ChatEdit, targetUser, payload, cancellationToken);
+                return true;
+            }
+
+            await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatEdit, payload, cancellationToken);
+            return true;
+        }
+
+        public async Task<bool> SendChatDeleteAsync(string targetUser, string threadId, string messageId, CancellationToken cancellationToken)
+        {
+            if (_user == null)
+            {
+                return false;
+            }
+
+            var payload = new LanChatDelete(
+                messageId,
+                _user.Username,
+                _user.DisplayName,
+                targetUser,
+                threadId,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+
+            if (string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase))
+            {
+                if (UseRelayForAll())
+                {
+                    await SendRelayPacketAsync(LanPacketTypes.ChatDelete, "all", payload, cancellationToken);
+                    return true;
+                }
+
+                return await BroadcastPacketAsync(LanPacketTypes.ChatDelete, payload, cancellationToken);
+            }
+
+            if (!_peers.TryGetValue(targetUser, out var peer))
+            {
+                return false;
+            }
+
+            if (ShouldUseRelay(targetUser, peer))
+            {
+                await SendRelayPacketAsync(LanPacketTypes.ChatDelete, targetUser, payload, cancellationToken);
+                return true;
+            }
+
+            await SendPacketAsync(peer.EndPoint, LanPacketTypes.ChatDelete, payload, cancellationToken);
+            return true;
         }
 
         private void UpsertPeer(string username, string displayName, IPEndPoint? remoteEndPoint, int listenPort, string source)
@@ -2381,7 +2592,12 @@ namespace Local_Network_Messenger.Services
                 return await BroadcastFileStreamAsync(fileName, sizeBytes, stream, contentType, fileId, cancellationToken);
             }
 
-            if (!_peers.TryGetValue(targetUser, out var peer) || !peer.IsOnline)
+            if (!_peers.TryGetValue(targetUser, out var peer))
+            {
+                return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
+            }
+
+            if (!peer.IsOnline && DateTimeOffset.UtcNow - peer.LastSeen > TimeSpan.FromMinutes(2))
             {
                 return new LanSendResult(false, 0, "Kisi agda bulunamadi.");
             }
@@ -2454,7 +2670,7 @@ namespace Local_Network_Messenger.Services
             {
                 sentBytes += read;
                 var base64 = Convert.ToBase64String(buffer, 0, read);
-                var cipher = await _cipher.EncryptAsync(base64, cancellationToken);
+                var cipher = await _cipher.EncryptBase64PayloadAsync(base64, cancellationToken);
                 var isLast = sentBytes >= sizeBytes;
                 var chunkPayload = new LanFileChunk(fileId, index, cipher, isLast);
                 var chunkPacket = new LanPacket(LanPacketTypes.FileChunk, JsonSerializer.SerializeToElement(chunkPayload, _jsonOptions));
@@ -2516,6 +2732,38 @@ namespace Local_Network_Messenger.Services
 
             var message = sent == 0 ? "Agda aktif kisi yok." : "Gonderildi.";
             return new LanSendResult(sent > 0, sent, message);
+        }
+
+        private async Task<bool> BroadcastPacketAsync(string type, object payload, CancellationToken cancellationToken)
+        {
+            var peers = _peers.Values;
+            if (peers.Count == 0)
+            {
+                return false;
+            }
+
+            var sent = 0;
+            foreach (var peer in peers)
+            {
+                if (!peer.IsOnline)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await SendPacketAsync(peer.EndPoint, type, payload, cancellationToken);
+                    sent += 1;
+                }
+                catch (SocketException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+            }
+
+            return sent > 0;
         }
 
         private async Task<LanSendResult> BroadcastFileStreamAsync(

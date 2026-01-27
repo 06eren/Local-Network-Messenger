@@ -1,5 +1,34 @@
 ﻿(() => {
-  document.addEventListener("contextmenu", (event) => event.preventDefault());
+  document.addEventListener("contextmenu", (event) => {
+    const row = event.target.closest?.("[data-message-id]");
+    if (!row) {
+      event.preventDefault();
+      hideContextMenu();
+      return;
+    }
+
+    const isMine = row.dataset.messageMine === "true";
+    if (!isMine) {
+      event.preventDefault();
+      hideContextMenu();
+      return;
+    }
+
+    event.preventDefault();
+    const messageId = row.dataset.messageId || "";
+    if (!messageId) {
+      hideContextMenu();
+      return;
+    }
+
+    const message = findMessageById(messageId);
+    if (message?.isDeleted) {
+      hideContextMenu();
+      return;
+    }
+
+    openContextMenu(event.clientX, event.clientY, messageId);
+  });
   document.addEventListener("dragstart", (event) => event.preventDefault());
 
   const viewAuth = document.querySelector("[data-view=\"auth\"]");
@@ -49,6 +78,7 @@
   const diagPortsEl = document.querySelector("[data-diag-ports]");
   const diagCryptoEl = document.querySelector("[data-diag-crypto]");
   const diagScanEl = document.querySelector("[data-diag-scan]");
+  const diagNetworkEl = document.querySelector("[data-diag-network]");
   const diagRelayEl = document.querySelector("[data-diag-relay]");
   const logListEl = document.querySelector("[data-log-list]");
   const logLimitSelect = document.querySelector("[data-log-limit]");
@@ -103,11 +133,33 @@
     messageQuery: "",
     messageFilter: "all",
     forceScroll: false,
+    editingMessageId: null,
   };
   let dragCounter = 0;
   let uiStatusTimer = null;
   let typingTimer = null;
   let typingActive = false;
+  let contextMessageId = null;
+
+  const contextMenu = document.createElement("div");
+  contextMenu.className = "context-menu hidden";
+  contextMenu.innerHTML = `
+    <button class="context-item" data-action="edit">Duzenle</button>
+    <button class="context-item" data-action="delete">Sil</button>
+  `;
+  document.body.appendChild(contextMenu);
+
+  const hideContextMenu = () => {
+    contextMenu.classList.add("hidden");
+    contextMessageId = null;
+  };
+
+  const openContextMenu = (x, y, messageId) => {
+    contextMessageId = messageId;
+    contextMenu.style.left = `${x}px`;
+    contextMenu.style.top = `${y}px`;
+    contextMenu.classList.remove("hidden");
+  };
 
   const copy = {
     login: {
@@ -390,6 +442,13 @@
     if (diagScanEl) {
       const mode = snapshot.scan?.mode ?? "basic";
       diagScanEl.textContent = mode === "pythonnet" ? "Python.NET" : mode === "process" ? "Proses" : "Basit";
+    }
+    if (diagNetworkEl) {
+      const analysis = snapshot.networkAnalysis ?? {};
+      const status = analysis.status ? String(analysis.status) : "bekleniyor";
+      const rawDetails = analysis.details ? String(analysis.details) : "";
+      const details = rawDetails && !rawDetails.toLowerCase().includes("ipc") ? ` (${rawDetails})` : "";
+      diagNetworkEl.textContent = `${status}${details}`;
     }
     if (diagRelayEl) {
       const relay = snapshot.relay ?? {};
@@ -731,6 +790,35 @@
     }
   };
 
+  const findMessageById = (messageId) => {
+    if (!messageId) {
+      return null;
+    }
+    for (const entry of Object.values(state.threads)) {
+      const match = entry?.find?.((message) => message.id === messageId);
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  };
+
+  const setEditMode = (messageId, messageText) => {
+    state.editingMessageId = messageId;
+    if (composeInput) {
+      composeInput.value = messageText || "";
+      composeInput.focus();
+    }
+    if (sendButton) {
+      sendButton.textContent = messageId ? "Guncelle" : "Gonder";
+    }
+    if (messageId) {
+      setChatStatus("Duzenleme modunda. Guncellemek icin gonder.", "info");
+    } else {
+      setChatStatus("");
+    }
+  };
+
   const MAX_FILE_BYTES = 200 * 1024 * 1024;
   const MAX_MESSAGE_CHARS = 1200;
 
@@ -958,7 +1046,9 @@
     const rows = filtered
       .map((message) => {
         const mineClass = message.isMine ? "message-row mine" : "message-row";
-        const text = escapeHtml(message.text);
+        const isDeleted = Boolean(message.isDeleted);
+        const isEdited = Boolean(message.isEdited);
+        const text = isDeleted ? "Mesaj silindi." : escapeHtml(message.text);
         const sender = escapeHtml(message.sender);
         const time = formatTime(message.sentAt);
         const deliveryInfo = message.isMine ? mapDeliveryState(message.deliveryState) : { label: "", className: "" };
@@ -966,7 +1056,7 @@
           ? `<span class=\"message-status ${deliveryInfo.className}\">${deliveryInfo.label}</span>`
           : "";
         let attachment = "";
-        if (message.attachment) {
+        if (message.attachment && !isDeleted) {
           const fileName = escapeHtml(message.attachment.fileName);
           const size = formatSize(message.attachment.sizeBytes);
           const scanStatus = message.attachment.status ? escapeHtml(message.attachment.status) : "";
@@ -1017,14 +1107,17 @@
             </div>`;
         }
 
+        const metaLabel = isEdited ? "<span class=\"message-meta\">Duzenlendi</span>" : "";
+        const deletedClass = isDeleted ? " is-deleted" : "";
         return `
-          <div class="${mineClass}">
-            <div class="message-bubble">
+          <div class="${mineClass}" data-message-id="${message.id}" data-message-mine="${message.isMine ? "true" : "false"}">
+            <div class="message-bubble${deletedClass}">
               <div class="message-sender">${sender}</div>
               <div class="message-text">${text}</div>
               ${attachment}
               <div class="message-foot">
                 <span>${time}</span>
+                ${metaLabel}
                 ${deliveryMarkup}
               </div>
             </div>
@@ -1034,11 +1127,14 @@
 
     const shouldStick = state.forceScroll || isNearBottom(messagesEl);
     const previousScrollTop = messagesEl.scrollTop;
+    const previousScrollHeight = messagesEl.scrollHeight;
     messagesEl.innerHTML = `<div class="message-stack">${rows}</div>`;
     if (shouldStick) {
       messagesEl.scrollTop = messagesEl.scrollHeight;
     } else {
-      messagesEl.scrollTop = previousScrollTop;
+      const nextScrollHeight = messagesEl.scrollHeight;
+      const delta = nextScrollHeight - previousScrollHeight;
+      messagesEl.scrollTop = previousScrollTop + (Number.isFinite(delta) ? delta : 0);
     }
     state.forceScroll = false;
   };
@@ -1059,7 +1155,11 @@
       } else if (active.isTyping) {
         chatStatusText.textContent = "Yaziyor...";
       } else if (active.status) {
-        chatStatusText.textContent = `Son gorulme: ${active.status}`;
+        if (String(active.status).toUpperCase() === "AKTIF") {
+          chatStatusText.textContent = "AKTIF";
+        } else {
+          chatStatusText.textContent = `Son gorulme: ${active.status}`;
+        }
       } else {
         chatStatusText.textContent = "Durum bilgisi yok.";
       }
@@ -1407,6 +1507,33 @@
       return;
     }
 
+    if (state.editingMessageId) {
+      const response = await postMessage("chat.edit", {
+        messageId: state.editingMessageId,
+        threadId: state.activeContactId,
+        text,
+      });
+      if (!response.ok) {
+        setChatStatus(response.payload?.message || "Mesaj duzenlenemedi.", "error");
+        return;
+      }
+
+      const message = findMessageById(state.editingMessageId);
+      if (message) {
+        message.text = text;
+        message.isEdited = true;
+        const contact = state.contacts.find((item) => item.id === message.threadId);
+        if (contact) {
+          contact.preview = text;
+          contact.status = "Az once";
+        }
+      }
+      setEditMode(null, "");
+      renderMessages();
+      renderContacts();
+      return;
+    }
+
     const parts = splitMessage(text);
     if (parts.length > 1) {
       setChatStatus(`Mesaj ${parts.length} parcaya bolundu.`, "info");
@@ -1560,6 +1687,54 @@
     }
   });
 
+  contextMenu.addEventListener("click", async (event) => {
+    const actionEl = event.target.closest("[data-action]");
+    if (!actionEl || !contextMessageId) {
+      return;
+    }
+
+    const action = actionEl.dataset.action;
+    const message = findMessageById(contextMessageId);
+    if (!message) {
+      hideContextMenu();
+      return;
+    }
+
+    if (action === "edit") {
+      setEditMode(contextMessageId, message.text || "");
+      hideContextMenu();
+      return;
+    }
+
+    if (action === "delete") {
+      const response = await postMessage("chat.delete", {
+        messageId: contextMessageId,
+        threadId: state.activeContactId,
+      });
+      if (!response.ok) {
+        setChatStatus(response.payload?.message || "Mesaj silinemedi.", "error");
+        hideContextMenu();
+        return;
+      }
+      message.text = "Mesaj silindi.";
+      message.isDeleted = true;
+      const contact = state.contacts.find((item) => item.id === message.threadId);
+      if (contact) {
+        contact.preview = message.text;
+        contact.status = "Az once";
+      }
+      hideContextMenu();
+      renderMessages();
+      renderContacts();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!contextMenu.classList.contains("hidden") && !event.target.closest(".context-menu")) {
+      hideContextMenu();
+    }
+  });
+
   contactsEl?.addEventListener("click", (event) => {
     const target = event.target.closest("[data-contact-id]");
     if (!target) {
@@ -1617,6 +1792,11 @@
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && settingsPanel && !settingsPanel.classList.contains("hidden")) {
       closeSettings();
+      return;
+    }
+
+    if (event.key === "Escape" && state.editingMessageId) {
+      setEditMode(null, "");
     }
   });
 

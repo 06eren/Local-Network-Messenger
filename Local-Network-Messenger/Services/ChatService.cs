@@ -59,7 +59,9 @@ namespace Local_Network_Messenger.Services
                     record.TextCipher,
                     record.SentAt,
                     attachment,
-                    record.DeliveryState);
+                    record.DeliveryState,
+                    record.IsEdited,
+                    record.IsDeleted);
 
                 if (!_threads.TryGetValue(record.ThreadId, out var list))
                 {
@@ -112,6 +114,50 @@ namespace Local_Network_Messenger.Services
             return new ChatSnapshot(user, contacts, threads, activeId);
         }
 
+        public NetworkQualitySummary GetNetworkQualitySummary()
+        {
+            var peers = new List<Contact>();
+            foreach (var contact in _contacts.Values)
+            {
+                if (contact.Id == NetworkThreadId || !contact.IsOnline)
+                {
+                    continue;
+                }
+                peers.Add(contact);
+            }
+
+            var peerCount = peers.Count;
+            double? avgPing = null;
+            double? avgLoss = null;
+            if (peerCount > 0)
+            {
+                var pingValues = new List<double>();
+                var lossValues = new List<double>();
+                foreach (var peer in peers)
+                {
+                    if (peer.PingMs.HasValue)
+                    {
+                        pingValues.Add(peer.PingMs.Value);
+                    }
+                    if (peer.LossPercent.HasValue)
+                    {
+                        lossValues.Add(peer.LossPercent.Value);
+                    }
+                }
+
+                if (pingValues.Count > 0)
+                {
+                    avgPing = Math.Round(pingValues.Average(), 1);
+                }
+                if (lossValues.Count > 0)
+                {
+                    avgLoss = Math.Round(lossValues.Average(), 1);
+                }
+            }
+
+            return new NetworkQualitySummary(peerCount, avgPing, avgLoss);
+        }
+
         public async Task<ChatMessageDto> AddMessageAsync(
             string threadId,
             string text,
@@ -134,7 +180,9 @@ namespace Local_Network_Messenger.Services
                 cipherText,
                 DateTimeOffset.UtcNow,
                 null,
-                "sent");
+                "sent",
+                false,
+                false);
 
             list.Add(message);
             contact.PreviewCipher = cipherText;
@@ -177,7 +225,9 @@ namespace Local_Network_Messenger.Services
                 textCipher,
                 DateTimeOffset.UtcNow,
                 attachment,
-                "sent");
+                "sent",
+                false,
+                false);
 
             list.Add(message);
             contact.PreviewCipher = textCipher;
@@ -193,7 +243,8 @@ namespace Local_Network_Messenger.Services
             string threadId,
             string sender,
             string text,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? messageId = null)
         {
             var contact = EnsureContact(threadId, sender);
             if (!_threads.TryGetValue(threadId, out var list))
@@ -202,16 +253,31 @@ namespace Local_Network_Messenger.Services
                 _threads[threadId] = list;
             }
 
+            if (!string.IsNullOrWhiteSpace(messageId))
+            {
+                var existing = list.Find(item => string.Equals(item.Id, messageId, StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                {
+                    contact.IsOnline = true;
+                    contact.LastSeenAt = DateTimeOffset.UtcNow;
+                    contact.IsTyping = false;
+                    await PersistAsync(existing, cancellationToken);
+                    return await MapMessageAsync(existing, cancellationToken);
+                }
+            }
+
             var cipherText = await _cipher.EncryptAsync(text, cancellationToken);
             var message = new ChatMessage(
-                Guid.NewGuid().ToString("N"),
+                string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("N") : messageId!,
                 threadId,
                 sender,
                 false,
                 cipherText,
                 DateTimeOffset.UtcNow,
                 null,
-                null);
+                null,
+                false,
+                false);
 
             list.Add(message);
             contact.PreviewCipher = cipherText;
@@ -286,7 +352,9 @@ namespace Local_Network_Messenger.Services
                 textCipher,
                 DateTimeOffset.UtcNow,
                 attachment,
-                null);
+                null,
+                false,
+                false);
 
             list.Add(message);
             contact.PreviewCipher = textCipher;
@@ -398,6 +466,78 @@ namespace Local_Network_Messenger.Services
             _ = _archive.UpdateDeliveryStateAsync(_session.CurrentUser?.Username ?? string.Empty, messageId, state, CancellationToken.None);
         }
 
+        public async Task<bool> EditMessageAsync(string messageId, string newText, bool requireMine, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(messageId) || string.IsNullOrWhiteSpace(newText))
+            {
+                return false;
+            }
+
+            if (!TryFindMessage(messageId, out var list, out var message, out var contact))
+            {
+                return false;
+            }
+
+            if (requireMine && !message.IsMine)
+            {
+                return false;
+            }
+
+            if (message.IsDeleted)
+            {
+                return false;
+            }
+
+            var cipherText = await _cipher.EncryptAsync(newText, cancellationToken);
+            message.TextCipher = cipherText;
+            message.IsEdited = true;
+
+            if (list.Count > 0 && ReferenceEquals(list[^1], message))
+            {
+                contact.PreviewCipher = cipherText;
+            }
+
+            await PersistAsync(message, cancellationToken);
+            return true;
+        }
+
+        public async Task<bool> DeleteMessageAsync(string messageId, bool requireMine, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrWhiteSpace(messageId))
+            {
+                return false;
+            }
+
+            if (!TryFindMessage(messageId, out var list, out var message, out var contact))
+            {
+                return false;
+            }
+
+            if (requireMine && !message.IsMine)
+            {
+                return false;
+            }
+
+            if (message.IsDeleted)
+            {
+                return false;
+            }
+
+            var deletedText = await _cipher.EncryptAsync("Mesaj silindi.", cancellationToken);
+            message.TextCipher = deletedText;
+            message.IsDeleted = true;
+            message.IsEdited = false;
+            message.Attachment = null;
+
+            if (list.Count > 0 && ReferenceEquals(list[^1], message))
+            {
+                contact.PreviewCipher = deletedText;
+            }
+
+            await PersistAsync(message, cancellationToken);
+            return true;
+        }
+
         public void UpdateTypingStatus(string contactId, bool isTyping)
         {
             if (!_contacts.TryGetValue(contactId, out var contact))
@@ -483,6 +623,28 @@ namespace Local_Network_Messenger.Services
                 CancellationToken.None);
         }
 
+        private bool TryFindMessage(string messageId, out List<ChatMessage> list, out ChatMessage message, out Contact contact)
+        {
+            foreach (var entry in _threads)
+            {
+                var match = entry.Value.Find(item => string.Equals(item.Id, messageId, StringComparison.OrdinalIgnoreCase));
+                if (match == null)
+                {
+                    continue;
+                }
+
+                list = entry.Value;
+                message = match;
+                contact = FindContact(entry.Key);
+                return true;
+            }
+
+            list = new List<ChatMessage>();
+            message = null!;
+            contact = null!;
+            return false;
+        }
+
         public void Reset()
         {
             _contacts.Clear();
@@ -507,6 +669,8 @@ namespace Local_Network_Messenger.Services
                 message.TextCipher,
                 message.SentAt,
                 message.DeliveryState,
+                message.IsEdited,
+                message.IsDeleted,
                 message.Attachment?.FileNameCipher,
                 message.Attachment?.SizeBytes,
                 message.Attachment?.Status,
@@ -603,7 +767,9 @@ namespace Local_Network_Messenger.Services
                 text,
                 message.SentAt,
                 attachment,
-                message.DeliveryState);
+                message.DeliveryState,
+                message.IsEdited,
+                message.IsDeleted);
         }
 
         private void Seed()
@@ -623,7 +789,7 @@ namespace Local_Network_Messenger.Services
         {
             if (isOnline)
             {
-                return "Simdi";
+                return "AKTIF";
             }
 
             if (!lastSeenAt.HasValue)
@@ -701,17 +867,42 @@ namespace Local_Network_Messenger.Services
             public string? LocalPath { get; set; } = LocalPath;
         }
 
-        private sealed record ChatMessage(
-            string Id,
-            string ThreadId,
-            string Sender,
-            bool IsMine,
-            string TextCipher,
-            DateTimeOffset SentAt,
-            ChatAttachment? Attachment,
-            string? DeliveryState)
+        private sealed class ChatMessage
         {
-            public string? DeliveryState { get; set; } = DeliveryState;
+            public ChatMessage(
+                string id,
+                string threadId,
+                string sender,
+                bool isMine,
+                string textCipher,
+                DateTimeOffset sentAt,
+                ChatAttachment? attachment,
+                string? deliveryState,
+                bool isEdited,
+                bool isDeleted)
+            {
+                Id = id;
+                ThreadId = threadId;
+                Sender = sender;
+                IsMine = isMine;
+                TextCipher = textCipher;
+                SentAt = sentAt;
+                Attachment = attachment;
+                DeliveryState = deliveryState;
+                IsEdited = isEdited;
+                IsDeleted = isDeleted;
+            }
+
+            public string Id { get; }
+            public string ThreadId { get; }
+            public string Sender { get; }
+            public bool IsMine { get; }
+            public string TextCipher { get; set; }
+            public DateTimeOffset SentAt { get; }
+            public ChatAttachment? Attachment { get; set; }
+            public string? DeliveryState { get; set; }
+            public bool IsEdited { get; set; }
+            public bool IsDeleted { get; set; }
         }
 
         public sealed record ChatNotification(string ThreadId, string DisplayName, string Sender, string Text);
