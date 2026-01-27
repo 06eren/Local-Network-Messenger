@@ -1092,7 +1092,7 @@ body {
   justify-content: space-between;
   gap: 16px;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .room-title {
@@ -1100,6 +1100,7 @@ body {
   align-items: center;
   gap: 12px;
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .room-tools {
@@ -1107,8 +1108,8 @@ body {
   align-items: center;
   gap: 10px;
   min-width: 0;
-  flex-wrap: wrap;
-  row-gap: 8px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
 }
 
 .room-quality {
@@ -1119,12 +1120,23 @@ body {
   background: rgba(60, 140, 126, 0.15);
   color: #bfece4;
   white-space: nowrap;
+  min-width: 150px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
 .room-quality.muted {
   border-color: var(--chat-border);
   background: rgba(255, 255, 255, 0.04);
   color: var(--chat-muted-2);
+}
+
+.room-quality.is-invisible {
+  visibility: hidden;
 }
 
 .room-search {
@@ -1134,6 +1146,8 @@ body {
   align-items: center;
   min-width: 0;
   max-width: 520px;
+  width: clamp(280px, 38vw, 520px);
+  flex: 0 0 auto;
 }
 
 .room-search-input {
@@ -1634,6 +1648,15 @@ body {
 }
 
 @media (max-width: 1100px) {
+  .room-header {
+    flex-wrap: wrap;
+  }
+
+  .room-tools {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+
   .room-search {
     width: 100%;
     max-width: none;

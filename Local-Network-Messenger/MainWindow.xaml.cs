@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -24,10 +25,28 @@ namespace Local_Network_Messenger
     {
         private const string HostName = "app.local";
         private const long MaxPreviewBytes = 50 * 1024 * 1024;
+        private const string WebUiManifestResource = "WebUI.manifest.json";
         private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
         {
             PropertyNameCaseInsensitive = true
         };
+        private readonly Dictionary<string, string> _webUiMimeTypes = new(StringComparer.OrdinalIgnoreCase)
+        {
+            [".html"] = "text/html; charset=utf-8",
+            [".css"] = "text/css; charset=utf-8",
+            [".js"] = "text/javascript; charset=utf-8",
+            [".json"] = "application/json; charset=utf-8",
+            [".svg"] = "image/svg+xml",
+            [".png"] = "image/png",
+            [".jpg"] = "image/jpeg",
+            [".jpeg"] = "image/jpeg",
+            [".gif"] = "image/gif",
+            [".webp"] = "image/webp",
+            [".ico"] = "image/x-icon",
+            [".woff"] = "font/woff",
+            [".woff2"] = "font/woff2"
+        };
+        private WebUiManifest? _webUiManifest;
         private readonly SessionState _sessionState;
         private readonly PasswordHasher _hasher;
         private readonly SessionStore _sessionStore;
@@ -98,10 +117,17 @@ namespace Local_Network_Messenger
         {
             Loaded -= OnLoaded;
 
-            var webRoot = Path.Combine(AppContext.BaseDirectory, "WebUI");
-            if (!Directory.Exists(webRoot))
+            if (!TryLoadWebUiManifest(out var manifest))
             {
-                WpfMessageBox.Show($"WebUI klasoru bulunamadi: {webRoot}", "WebUI", MessageBoxButton.OK, MessageBoxImage.Error);
+                WpfMessageBox.Show("WebUI paketleri yuklenemedi.", "WebUI", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+            _webUiManifest = manifest;
+
+            if (!VerifyWebUiIntegrity(manifest))
+            {
+                WpfMessageBox.Show("WebUI dosyalari degistirilmis veya eksik. Uygulama kapatilacak.", "Guvenlik", MessageBoxButton.OK, MessageBoxImage.Error);
+                Close();
                 return;
             }
 
@@ -110,7 +136,9 @@ namespace Local_Network_Messenger
 
             try
             {
-                await MessengerView.EnsureCoreWebView2Async();
+                var userDataPath = AppPaths.WebViewUserDataPath;
+                var environment = await CoreWebView2Environment.CreateAsync(null, userDataPath);
+                await MessengerView.EnsureCoreWebView2Async(environment);
             }
             catch (Exception ex)
             {
@@ -129,15 +157,15 @@ namespace Local_Network_Messenger
             settings.IsGeneralAutofillEnabled = false;
             settings.AreBrowserAcceleratorKeysEnabled = false;
 
-            MessengerView.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                HostName,
-                webRoot,
-                CoreWebView2HostResourceAccessKind.DenyCors);
+            MessengerView.CoreWebView2.AddWebResourceRequestedFilter(
+                $"https://{HostName}/*",
+                CoreWebView2WebResourceContext.All);
 
             MessengerView.CoreWebView2.NavigationStarting += OnNavigationStarting;
             MessengerView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
             MessengerView.CoreWebView2.ContextMenuRequested += OnContextMenuRequested;
             MessengerView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+            MessengerView.CoreWebView2.WebResourceRequested += OnWebResourceRequested;
             MessengerView.Source = new Uri($"https://{HostName}/index.html");
             MessengerView.AllowDrop = true;
             MessengerView.PreviewDragOver += OnWebViewDragOver;
@@ -183,6 +211,161 @@ namespace Local_Network_Messenger
                 _chatArchiveStore = new NoopChatArchiveStore();
                 _chatService.SetArchiveStore(_chatArchiveStore);
             }
+        }
+
+        private bool TryLoadWebUiManifest(out WebUiManifest manifest)
+        {
+            manifest = new WebUiManifest(0, new Dictionary<string, string>());
+            try
+            {
+                using var stream = GetEmbeddedResourceStream(WebUiManifestResource);
+                if (stream == null)
+                {
+                    return false;
+                }
+                using var reader = new StreamReader(stream, Encoding.UTF8, true);
+                var json = reader.ReadToEnd();
+                var parsed = JsonSerializer.Deserialize<WebUiManifest>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+                if (parsed == null || parsed.Files == null || parsed.Files.Count == 0)
+                {
+                    return false;
+                }
+                manifest = parsed;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool VerifyWebUiIntegrity(WebUiManifest manifest)
+        {
+            foreach (var entry in manifest.Files)
+            {
+                var path = entry.Key;
+                var expected = entry.Value;
+                if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(expected))
+                {
+                    return false;
+                }
+                using var stream = GetWebUiResourceStream(path);
+                if (stream == null)
+                {
+                    return false;
+                }
+                var hash = ComputeSha256Hex(stream);
+                if (!string.Equals(hash, expected, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private Stream? GetWebUiResourceStream(string relativePath)
+        {
+            var normalized = relativePath.Replace("\\", "/").TrimStart('/');
+            var directName = $"WebUI/{normalized}";
+            var stream = GetEmbeddedResourceStream(directName);
+            if (stream != null)
+            {
+                return stream;
+            }
+            var fallbackName = $"WebUI\\{normalized.Replace("/", "\\")}";
+            stream = GetEmbeddedResourceStream(fallbackName);
+            if (stream != null)
+            {
+                return stream;
+            }
+            return null;
+        }
+
+        private static Stream? GetEmbeddedResourceStream(string resourceName)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream != null)
+            {
+                return stream;
+            }
+
+            foreach (var name in assembly.GetManifestResourceNames())
+            {
+                if (name.EndsWith(resourceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return assembly.GetManifestResourceStream(name);
+                }
+            }
+            return null;
+        }
+
+        private static string ComputeSha256Hex(Stream stream)
+        {
+            using var sha = SHA256.Create();
+            var hash = sha.ComputeHash(stream);
+            return Convert.ToHexString(hash).ToLowerInvariant();
+        }
+
+        private string GetMimeType(string extension)
+        {
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                return "application/octet-stream";
+            }
+            return _webUiMimeTypes.TryGetValue(extension, out var type)
+                ? type
+                : "application/octet-stream";
+        }
+
+        private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
+        {
+            if (_webUiManifest == null || MessengerView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            if (!Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri))
+            {
+                return;
+            }
+
+            if (!string.Equals(uri.Host, HostName, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var path = Uri.UnescapeDataString(uri.AbsolutePath).TrimStart('/');
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                path = "index.html";
+            }
+
+            if (!_webUiManifest.Files.ContainsKey(path))
+            {
+                e.Response = MessengerView.CoreWebView2.Environment.CreateWebResourceResponse(
+                    new MemoryStream(Array.Empty<byte>()), 404, "Not Found", "Content-Type: text/plain");
+                return;
+            }
+
+            using var resourceStream = GetWebUiResourceStream(path);
+            if (resourceStream == null)
+            {
+                e.Response = MessengerView.CoreWebView2.Environment.CreateWebResourceResponse(
+                    new MemoryStream(Array.Empty<byte>()), 404, "Not Found", "Content-Type: text/plain");
+                return;
+            }
+
+            using var ms = new MemoryStream();
+            resourceStream.CopyTo(ms);
+            ms.Position = 0;
+            var ext = Path.GetExtension(path);
+            var contentType = GetMimeType(ext);
+            e.Response = MessengerView.CoreWebView2.Environment.CreateWebResourceResponse(
+                new MemoryStream(ms.ToArray()), 200, "OK", $"Content-Type: {contentType}\r\nCache-Control: no-store");
         }
 
         private async Task EnsureFirewallRulesAsync()
@@ -234,6 +417,7 @@ namespace Local_Network_Messenger
                     FileName = config.CryptoExecutable,
                     Arguments = config.CryptoArguments ?? string.Empty
                 };
+                startInfo.WorkingDirectory = Path.GetDirectoryName(config.CryptoExecutable) ?? AppContext.BaseDirectory;
                 _cryptoClient = new ProcessJsonClient(startInfo, _jsonOptions, TimeSpan.FromSeconds(20));
                 return new CryptoProcessBridge(_cryptoClient);
             }
@@ -280,6 +464,7 @@ namespace Local_Network_Messenger
                         FileName = config.ScanExecutable!,
                         Arguments = NormalizePythonScanArguments(config.ScanArguments)
                     };
+                    startInfo.WorkingDirectory = AppContext.BaseDirectory;
                     startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
                     startInfo.Environment["PYTHONUTF8"] = "1";
                     startInfo.Environment["PYTHONUNBUFFERED"] = "1";
@@ -582,7 +767,11 @@ namespace Local_Network_Messenger
             {
                 var state = e.IsOutgoing ? "sending" : "receiving";
                 _chatService.UpdateFileProgress(e.MessageId, e.Progress, state);
-                ScheduleSnapshotPush();
+                _ = SendChatProgressAsync(e.ThreadId, e.MessageId, e.Progress, state);
+                if (e.Progress >= 100)
+                {
+                    ScheduleSnapshotPush();
+                }
             });
         }
 
@@ -696,6 +885,31 @@ namespace Local_Network_Messenger
 
             var payload = new { message, tone };
             var response = new WebResponse(Guid.NewGuid().ToString("N"), "chat.status", true, payload, null);
+            var json = JsonSerializer.Serialize(response, _jsonOptions);
+            MessengerView.CoreWebView2.PostWebMessageAsJson(json);
+            return Task.CompletedTask;
+        }
+
+        private Task SendChatProgressAsync(string threadId, string messageId, double progress, string transferState)
+        {
+            if (!Dispatcher.CheckAccess())
+            {
+                return Dispatcher.InvokeAsync(() => SendChatProgressAsync(threadId, messageId, progress, transferState)).Task;
+            }
+
+            if (MessengerView.CoreWebView2 == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var payload = new
+            {
+                threadId,
+                messageId,
+                progress,
+                transferState
+            };
+            var response = new WebResponse(Guid.NewGuid().ToString("N"), "chat.progress", true, payload, null);
             var json = JsonSerializer.Serialize(response, _jsonOptions);
             MessengerView.CoreWebView2.PostWebMessageAsJson(json);
             return Task.CompletedTask;
@@ -1450,6 +1664,7 @@ namespace Local_Network_Messenger
         }
 
         private sealed record ThemePalette(string Accent, string AccentStrong, string AccentSoft, string BubbleMine);
+        private sealed record WebUiManifest(int Version, Dictionary<string, string> Files);
         private sealed record SecurityLogEntry(DateTimeOffset At, string Type, string? User, string Message, string? Details);
         private sealed record ArchiveExportEntry(
             string ThreadId,

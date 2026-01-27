@@ -48,5 +48,15 @@ namespace Local_Network_Messenger.Services
                 return path;
             }
         }
+
+        public static string WebViewUserDataPath
+        {
+            get
+            {
+                var path = Path.Combine(DataRoot, "WebView2");
+                Directory.CreateDirectory(path);
+                return path;
+            }
+        }
     }
 }

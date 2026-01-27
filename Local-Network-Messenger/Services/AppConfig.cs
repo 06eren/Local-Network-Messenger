@@ -75,6 +75,21 @@ namespace Local_Network_Messenger.Services
         private static AppConfig ResolveDefaults(AppConfig config)
         {
             var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrWhiteSpace(config.CryptoDllPath) && !File.Exists(config.CryptoDllPath))
+            {
+                config = config with { CryptoDllPath = null };
+            }
+
+            if (!string.IsNullOrWhiteSpace(config.CryptoExecutable) && !File.Exists(config.CryptoExecutable))
+            {
+                config = config with { CryptoExecutable = null };
+            }
+
+            if (!string.IsNullOrWhiteSpace(config.ScanExecutable) && !File.Exists(config.ScanExecutable))
+            {
+                config = config with { ScanExecutable = null, ScanArguments = null };
+            }
+
             var cryptoDll = Path.Combine(baseDir, "Tools", "crypto_bridge.dll");
             if (string.IsNullOrWhiteSpace(config.CryptoDllPath) && File.Exists(cryptoDll))
             {

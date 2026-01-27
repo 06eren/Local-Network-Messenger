@@ -760,6 +760,33 @@
     return parts.join(" · ");
   };
 
+  let qualityTimer = null;
+  let pendingQuality = null;
+  let lastQuality = { text: "", muted: false, invisible: true };
+  const scheduleQualityUpdate = (text, muted, invisible) => {
+    pendingQuality = { text, muted, invisible };
+    if (qualityTimer) {
+      return;
+    }
+    qualityTimer = setTimeout(() => {
+      qualityTimer = null;
+      if (!connectionQualityEl || !pendingQuality) {
+        return;
+      }
+      if (
+        pendingQuality.text === lastQuality.text &&
+        pendingQuality.muted === lastQuality.muted &&
+        pendingQuality.invisible === lastQuality.invisible
+      ) {
+        return;
+      }
+      connectionQualityEl.textContent = pendingQuality.text;
+      connectionQualityEl.classList.toggle("muted", pendingQuality.muted);
+      connectionQualityEl.classList.toggle("is-invisible", pendingQuality.invisible);
+      lastQuality = pendingQuality;
+    }, 200);
+  };
+
   const mapDeliveryState = (state) => {
     switch (state) {
       case "read":
@@ -801,6 +828,58 @@
       }
     }
     return null;
+  };
+
+  const updateMessageRow = (message) => {
+    if (!message || !messagesEl || message.threadId !== state.activeContactId) {
+      return;
+    }
+
+    const escapedId = window.CSS?.escape ? CSS.escape(message.id) : message.id.replace(/"/g, "");
+    const row = messagesEl.querySelector(`[data-message-id="${escapedId}"]`);
+    if (!row) {
+      return;
+    }
+
+    const attachment = message.attachment;
+    if (!attachment) {
+      return;
+    }
+
+    const progressValue = typeof attachment.progress === "number"
+      ? Math.max(0, Math.min(100, attachment.progress))
+      : null;
+    const transferLabel = mapTransferState(attachment.transferState);
+    const scanStatus = attachment.status || "";
+    const sizeLabel = formatSize(attachment.sizeBytes);
+    const metaParts = [sizeLabel, scanStatus, transferLabel].filter(Boolean).join(" • ");
+
+    const subEl = row.querySelector(".attachment-sub");
+    if (subEl) {
+      subEl.textContent = metaParts;
+    }
+
+    let progressBar = row.querySelector(".attachment-progress span");
+    if (progressValue === null) {
+      progressBar?.parentElement?.remove();
+      return;
+    }
+
+    if (!progressBar) {
+      const meta = row.querySelector(".attachment-meta");
+      if (meta) {
+        const progressWrap = document.createElement("div");
+        progressWrap.className = "attachment-progress";
+        const span = document.createElement("span");
+        progressWrap.appendChild(span);
+        meta.appendChild(progressWrap);
+        progressBar = span;
+      }
+    }
+
+    if (progressBar) {
+      progressBar.style.width = `${progressValue}%`;
+    }
   };
 
   const setEditMode = (messageId, messageText) => {
@@ -1139,11 +1218,7 @@
     state.forceScroll = false;
   };
 
-  const setActiveContact = (contactId, notify = true) => {
-    const previous = state.activeContactId;
-    state.activeContactId = contactId;
-    const changed = previous !== contactId;
-    const active = state.contacts.find((contact) => contact.id === contactId);
+  const updateActiveHeader = (active) => {
     if (chatTitleEl) {
       chatTitleEl.textContent = active ? active.displayName : "Secili kisi yok";
     }
@@ -1166,13 +1241,10 @@
     }
     if (connectionQualityEl) {
       if (!active || active.id === "all") {
-        connectionQualityEl.textContent = "";
-        connectionQualityEl.classList.add("hidden");
+        scheduleQualityUpdate(" ", true, true);
       } else {
         const quality = formatQuality(active);
-        connectionQualityEl.textContent = quality || "Baglanti kalitesi bilinmiyor";
-        connectionQualityEl.classList.remove("hidden");
-        connectionQualityEl.classList.toggle("muted", !quality);
+        scheduleQualityUpdate(quality || "Baglanti kalitesi bilinmiyor", !quality, false);
       }
     }
     if (typingIndicator) {
@@ -1182,6 +1254,15 @@
       const initials = active ? initialsFromName(active.displayName) : "LN";
       chatAvatarEl.textContent = initials || "LN";
     }
+  };
+
+  const setActiveContact = (contactId, notify = true) => {
+    const previous = state.activeContactId;
+    state.activeContactId = contactId;
+    const changed = previous !== contactId;
+    const active = state.contacts.find((contact) => contact.id === contactId);
+
+    updateActiveHeader(active);
 
     if (messageSearchInput && state.messageQuery) {
       messageSearchInput.value = "";
@@ -1231,6 +1312,7 @@
       return;
     }
 
+    const previousActive = state.activeContactId;
     state.user = snapshot.currentUser ?? state.user;
     state.contacts = snapshot.contacts ?? state.contacts;
     state.threads = snapshot.threads ?? state.threads;
@@ -1267,7 +1349,14 @@
       networkCountEl.title = `${total} toplam`;
     }
 
-    setActiveContact(state.activeContactId, !typingActive);
+    if (previousActive !== state.activeContactId) {
+      setActiveContact(state.activeContactId, false);
+    } else {
+      const active = state.contacts.find((contact) => contact.id === state.activeContactId);
+      updateActiveHeader(active);
+      renderContacts();
+      renderMessages();
+    }
   };
 
   const loadSnapshot = async () => {
@@ -1961,6 +2050,24 @@
 
       if (data.type === "chat.push" && data.payload) {
         applySnapshot(data.payload);
+        return;
+      }
+
+      if (data.type === "chat.progress" && data.payload) {
+        const messageId = data.payload.messageId || "";
+        const message = findMessageById(messageId);
+        if (message && message.attachment) {
+          if (typeof data.payload.progress === "number") {
+            message.attachment.progress = data.payload.progress;
+          }
+          if (data.payload.transferState) {
+            message.attachment.transferState = data.payload.transferState;
+          }
+          if (data.payload.status) {
+            message.attachment.status = data.payload.status;
+          }
+          updateMessageRow(message);
+        }
         return;
       }
 

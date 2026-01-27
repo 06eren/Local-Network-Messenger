@@ -16,14 +16,19 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="WebUI\\**\\*">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
+    <EmbeddedResource Include="WebUI\\**\\*">
+      <LogicalName>WebUI/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="WebUI.manifest.json">
+      <LogicalName>WebUI.manifest.json</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>
     <Content Include="Tools\\**\\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
   </ItemGroup>
 
