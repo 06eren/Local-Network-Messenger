@@ -49,6 +49,7 @@ namespace Local_Network_Messenger.Services
                         record.AttachmentProgress,
                         record.AttachmentTransferState,
                         null,
+                        null,
                         null);
                 var message = new ChatMessage(
                     record.Id,
@@ -153,7 +154,8 @@ namespace Local_Network_Messenger.Services
             CancellationToken cancellationToken,
             string? messageId = null,
             string? contentType = null,
-            string? previewDataUrl = null)
+            string? previewDataUrl = null,
+            string? localPath = null)
         {
             var user = RequireUser();
             var contact = FindContact(threadId);
@@ -166,7 +168,7 @@ namespace Local_Network_Messenger.Services
             var text = "Dosya paylasildi";
             var textCipher = await _cipher.EncryptAsync(text, cancellationToken);
             var fileCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
-            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl);
+            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl, localPath);
             var message = new ChatMessage(
                 string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("N") : messageId!,
                 threadId,
@@ -232,7 +234,8 @@ namespace Local_Network_Messenger.Services
             CancellationToken cancellationToken,
             string? messageId = null,
             string? contentType = null,
-            string? previewDataUrl = null)
+            string? previewDataUrl = null,
+            string? localPath = null)
         {
             var contact = EnsureContact(threadId, sender);
             if (!_threads.TryGetValue(threadId, out var list))
@@ -257,6 +260,10 @@ namespace Local_Network_Messenger.Services
                         {
                             existing.Attachment.PreviewDataUrl = previewDataUrl;
                         }
+                        if (!string.IsNullOrWhiteSpace(localPath))
+                        {
+                            existing.Attachment.LocalPath = localPath;
+                        }
                     }
                     contact.PreviewCipher = existing.TextCipher;
                     contact.IsOnline = true;
@@ -270,7 +277,7 @@ namespace Local_Network_Messenger.Services
             var text = "Dosya paylasildi";
             var textCipher = await _cipher.EncryptAsync(text, cancellationToken);
             var fileCipher = await _cipher.EncryptAsync(fileName, cancellationToken);
-            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl);
+            var attachment = new ChatAttachment(fileCipher, sizeBytes, status, 0, "in-progress", contentType, previewDataUrl, localPath);
             var message = new ChatMessage(
                 string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString("N") : messageId!,
                 threadId,
@@ -584,7 +591,8 @@ namespace Local_Network_Messenger.Services
                     message.Attachment.Progress,
                     message.Attachment.TransferState,
                     message.Attachment.ContentType,
-                    message.Attachment.PreviewDataUrl);
+                    message.Attachment.PreviewDataUrl,
+                    message.Attachment.LocalPath);
             }
 
             return new ChatMessageDto(
@@ -682,13 +690,15 @@ namespace Local_Network_Messenger.Services
             double? Progress,
             string? TransferState,
             string? ContentType,
-            string? PreviewDataUrl)
+            string? PreviewDataUrl,
+            string? LocalPath)
         {
             public string Status { get; set; } = Status;
             public double? Progress { get; set; } = Progress;
             public string? TransferState { get; set; } = TransferState;
             public string? ContentType { get; set; } = ContentType;
             public string? PreviewDataUrl { get; set; } = PreviewDataUrl;
+            public string? LocalPath { get; set; } = LocalPath;
         }
 
         private sealed record ChatMessage(

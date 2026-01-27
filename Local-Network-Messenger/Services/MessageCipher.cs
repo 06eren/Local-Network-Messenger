@@ -40,6 +40,7 @@ namespace Local_Network_Messenger.Services
             }
 
             var payload = string.IsNullOrWhiteSpace(result.PayloadBase64) ? plainBase64 : result.PayloadBase64;
+            payload = NormalizeBase64(payload);
             return $"{CipherPrefix}{payload}";
         }
 
@@ -58,7 +59,7 @@ namespace Local_Network_Messenger.Services
 
             if (payload.StartsWith(CipherPrefix, StringComparison.Ordinal))
             {
-                var base64 = payload.Substring(CipherPrefix.Length);
+                var base64 = NormalizeBase64(payload.Substring(CipherPrefix.Length));
                 var result = await _bridge.DecryptAsync(new CryptoRequest(_keyId, base64), cancellationToken);
                 if (!string.Equals(result.Status, "ok", StringComparison.OrdinalIgnoreCase))
                 {
@@ -66,6 +67,7 @@ namespace Local_Network_Messenger.Services
                 }
 
                 var resolved = string.IsNullOrWhiteSpace(result.PayloadBase64) ? base64 : result.PayloadBase64;
+                resolved = NormalizeBase64(resolved);
                 return DecodeBase64OrFallback(resolved, "Sifre cozulmedi.");
             }
 
@@ -83,6 +85,26 @@ namespace Local_Network_Messenger.Services
             {
                 return fallback;
             }
+        }
+
+        private static string NormalizeBase64(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            var buffer = new char[value.Length];
+            var length = 0;
+            foreach (var ch in value)
+            {
+                if (!char.IsWhiteSpace(ch))
+                {
+                    buffer[length++] = ch;
+                }
+            }
+
+            return new string(buffer, 0, length);
         }
     }
 }

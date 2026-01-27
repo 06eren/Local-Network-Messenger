@@ -21,7 +21,8 @@ namespace Local_Network_Messenger.Models
         double? Progress,
         string? TransferState,
         string? ContentType,
-        string? PreviewDataUrl);
+        string? PreviewDataUrl,
+        string? LocalPath);
 
     public sealed record ChatMessageDto(
         string Id,
@@ -70,4 +71,6 @@ namespace Local_Network_Messenger.Models
     public sealed record FileScanRequest(string FileName, long SizeBytes, string? ContentType);
 
     public sealed record FileScanResult(string Status, string Message, string? Details);
+
+    public sealed record FileActionRequest(string Path, string Action);
 }

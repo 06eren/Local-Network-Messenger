@@ -180,7 +180,7 @@ namespace Local_Network_Messenger.Services
 
     public sealed class LanTransportService : IAsyncDisposable
     {
-        private const int ChunkSize = 32 * 1024;
+        private const int ChunkSize = 64 * 1024;
         private static readonly TimeSpan PresenceInterval = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan PresenceTimeout = TimeSpan.FromSeconds(12);
         private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(5);
@@ -198,6 +198,7 @@ namespace Local_Network_Messenger.Services
         private readonly ConcurrentDictionary<string, bool> _manualPeers = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, RelayClientSession> _relaySessions = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, PingTracker> _pingTrackers = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, ProgressState> _progressStates = new(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _relayWriteLock = new(1, 1);
         private readonly string _instanceId = Guid.NewGuid().ToString("N");
         private readonly int _discoveryPort;
@@ -319,6 +320,7 @@ namespace Local_Network_Messenger.Services
             _incomingFiles.Clear();
             _manualPeers.Clear();
             _pingTrackers.Clear();
+            _progressStates.Clear();
 
             await StopRelayClientAsync();
             await StopRelayServerAsync();
@@ -1061,12 +1063,16 @@ namespace Local_Network_Messenger.Services
                 var threadId = string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase)
                     ? "all"
                     : targetUser;
-                FileTransferProgress?.Invoke(
-                    this,
-                    new FileTransferProgressEventArgs(threadId, fileId, progress, true));
+                if (ShouldReportProgress(fileId, progress))
+                {
+                    FileTransferProgress?.Invoke(
+                        this,
+                        new FileTransferProgressEventArgs(threadId, fileId, progress, true));
+                }
                 index += 1;
             }
 
+            ClearProgressState(fileId);
             return true;
         }
 
@@ -1794,9 +1800,12 @@ namespace Local_Network_Messenger.Services
             var progressThreadId = string.Equals(session.Start.To, "all", StringComparison.OrdinalIgnoreCase)
                 ? "all"
                 : session.Start.From;
-            FileTransferProgress?.Invoke(
-                this,
-                new FileTransferProgressEventArgs(progressThreadId, session.Start.FileId, progress, false));
+            if (ShouldReportProgress(session.Start.FileId, progress))
+            {
+                FileTransferProgress?.Invoke(
+                    this,
+                    new FileTransferProgressEventArgs(progressThreadId, session.Start.FileId, progress, false));
+            }
 
             if (chunk.IsLast || session.BytesWritten >= session.Start.SizeBytes)
             {
@@ -1831,6 +1840,7 @@ namespace Local_Network_Messenger.Services
                         session.Start.SizeBytes,
                         session.Start.ContentType,
                         scan));
+                ClearProgressState(session.Start.FileId);
             }
         }
 
@@ -1874,6 +1884,7 @@ namespace Local_Network_Messenger.Services
                     session.Start.SizeBytes,
                     session.Start.ContentType,
                     result));
+            ClearProgressState(session.Start.FileId);
         }
 
         private async Task WritePacketAsync(StreamWriter writer, string type, object payload, CancellationToken cancellationToken)
@@ -2183,6 +2194,29 @@ namespace Local_Network_Messenger.Services
             }
         }
 
+        private bool ShouldReportProgress(string fileId, double progress)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (!_progressStates.TryGetValue(fileId, out var state))
+            {
+                _progressStates[fileId] = new ProgressState(progress, now);
+                return true;
+            }
+
+            if (progress >= 100 || progress - state.Progress >= 1 || now - state.UpdatedAt >= TimeSpan.FromMilliseconds(250))
+            {
+                _progressStates[fileId] = new ProgressState(progress, now);
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ClearProgressState(string fileId)
+        {
+            _progressStates.TryRemove(fileId, out _);
+        }
+
         private async Task SendPingBatchAsync(CancellationToken cancellationToken)
         {
             if (_user == null)
@@ -2429,11 +2463,16 @@ namespace Local_Network_Messenger.Services
                 var threadId = string.Equals(targetUser, "all", StringComparison.OrdinalIgnoreCase)
                     ? "all"
                     : targetUser;
-                FileTransferProgress?.Invoke(
-                    this,
-                    new FileTransferProgressEventArgs(threadId, fileId, progress, true));
+                if (ShouldReportProgress(fileId, progress))
+                {
+                    FileTransferProgress?.Invoke(
+                        this,
+                        new FileTransferProgressEventArgs(threadId, fileId, progress, true));
+                }
                 index += 1;
             }
+
+            ClearProgressState(fileId);
         }
 
         private async Task<LanSendResult> BroadcastMessageAsync(string text, CancellationToken cancellationToken)
@@ -2598,6 +2637,8 @@ namespace Local_Network_Messenger.Services
         }
 
         private sealed record PingOutcome(bool Success, double? LatencyMs);
+
+        private sealed record ProgressState(double Progress, DateTimeOffset UpdatedAt);
 
         private sealed class RelayClientSession
         {

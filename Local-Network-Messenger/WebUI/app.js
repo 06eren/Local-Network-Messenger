@@ -731,7 +731,7 @@
     }
   };
 
-  const MAX_FILE_BYTES = 10 * 1024 * 1024;
+  const MAX_FILE_BYTES = 200 * 1024 * 1024;
   const MAX_MESSAGE_CHARS = 1200;
 
   const readFileAsBase64 = (file) =>
@@ -978,8 +978,30 @@
             ? `<div class=\"attachment-progress\"><span style=\"width:${progressValue}%\"></span></div>`
             : "";
           const preview = message.attachment.previewDataUrl;
-          const previewMarkup = preview
-            ? `<img class=\"attachment-preview\" src=\"${preview}\" alt=\"${fileName}\" />`
+          const contentType = message.attachment.contentType || "";
+          const localPath = message.attachment.localPath || "";
+          let previewMarkup = "";
+          if (preview) {
+            if (contentType.startsWith("video/")) {
+              previewMarkup = `<video class=\"attachment-preview\" src=\"${preview}\" controls preload=\"metadata\" playsinline muted></video>`;
+            } else if (contentType.startsWith("audio/")) {
+              previewMarkup = `<audio class=\"attachment-audio\" src=\"${preview}\" controls></audio>`;
+            } else {
+              previewMarkup = `<img class=\"attachment-preview\" src=\"${preview}\" alt=\"${fileName}\" loading=\"lazy\" />`;
+            }
+          } else if (contentType.startsWith("video/")) {
+            previewMarkup = `<div class=\"attachment-placeholder\">Video dosyasi</div>`;
+          } else if (contentType.startsWith("audio/")) {
+            previewMarkup = `<div class=\"attachment-placeholder\">Ses dosyasi</div>`;
+          } else if (contentType.startsWith("image/")) {
+            previewMarkup = `<div class=\"attachment-placeholder\">Resim dosyasi</div>`;
+          }
+          const actionsMarkup = localPath
+            ? `
+              <div class=\"attachment-actions\">
+                <button class=\"attachment-btn\" data-file-action=\"open\" data-file-path=\"${escapeHtml(localPath)}\">Dosyayi ac</button>
+                <button class=\"attachment-btn\" data-file-action=\"reveal\" data-file-path=\"${escapeHtml(localPath)}\">Klasorde goster</button>
+              </div>`
             : "";
           const metaParts = [size, scanStatus, transferLabel].filter(Boolean).join(" • ");
           const metaMarkup = metaParts ? `<div class=\"attachment-sub\">${metaParts}</div>` : "";
@@ -990,6 +1012,7 @@
                 <div class=\"attachment-name\">${fileName}</div>
                 ${metaMarkup}
                 ${progressMarkup}
+                ${actionsMarkup}
               </div>
             </div>`;
         }
@@ -1138,8 +1161,10 @@
     }
 
     if (networkCountEl) {
-      const count = state.contacts.filter((contact) => contact.id !== "all").length;
-      networkCountEl.textContent = `${count} kisi`;
+      const total = state.contacts.filter((contact) => contact.id !== "all").length;
+      const online = state.contacts.filter((contact) => contact.id !== "all" && contact.isOnline).length;
+      networkCountEl.textContent = `${online} aktif`;
+      networkCountEl.title = `${total} toplam`;
     }
 
     setActiveContact(state.activeContactId, !typingActive);
@@ -1436,7 +1461,7 @@
     }
 
     if (file.size > MAX_FILE_BYTES) {
-      setChatStatus("Dosya boyutu 10 MB uzerinde. Daha kucuk bir dosya sec.", "error");
+      setChatStatus(`Dosya boyutu ${formatSize(MAX_FILE_BYTES)} uzerinde. Daha kucuk bir dosya sec.`, "error");
       return;
     }
 
@@ -1520,6 +1545,19 @@
         setMode(mode);
       }
     });
+  });
+
+  messagesEl?.addEventListener("click", (event) => {
+    const actionEl = event.target.closest("[data-file-action]");
+    if (!actionEl) {
+      return;
+    }
+
+    const action = actionEl.dataset.fileAction || "open";
+    const path = actionEl.dataset.filePath || "";
+    if (path) {
+      postMessage("file.open", { path, action });
+    }
   });
 
   contactsEl?.addEventListener("click", (event) => {

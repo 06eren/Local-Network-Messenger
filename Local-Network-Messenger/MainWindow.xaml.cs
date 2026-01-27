@@ -23,7 +23,7 @@ namespace Local_Network_Messenger
     public partial class MainWindow : Window
     {
         private const string HostName = "app.local";
-        private const long MaxPreviewBytes = 512 * 1024;
+        private const long MaxPreviewBytes = 50 * 1024 * 1024;
         private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
         {
             PropertyNameCaseInsensitive = true
@@ -501,7 +501,8 @@ namespace Local_Network_Messenger
                     CancellationToken.None,
                     e.MessageId,
                     e.ContentType,
-                    preview);
+                    preview,
+                    e.FilePath);
                 _chatService.UpdateFileProgress(e.MessageId, 100, "completed");
                 if (string.Equals(e.ThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
                 {
@@ -723,7 +724,8 @@ namespace Local_Network_Messenger
                     CancellationToken.None,
                     null,
                     contentType,
-                    preview);
+                    preview,
+                    null);
             }
             catch (InvalidOperationException ex)
             {
@@ -953,6 +955,28 @@ namespace Local_Network_Messenger
                 ".jpg" => "image/jpeg",
                 ".jpeg" => "image/jpeg",
                 ".gif" => "image/gif",
+                ".webp" => "image/webp",
+                ".bmp" => "image/bmp",
+                ".tif" => "image/tiff",
+                ".tiff" => "image/tiff",
+                ".heic" => "image/heic",
+                ".heif" => "image/heif",
+                ".svg" => "image/svg+xml",
+                ".mp4" => "video/mp4",
+                ".m4v" => "video/x-m4v",
+                ".mov" => "video/quicktime",
+                ".webm" => "video/webm",
+                ".avi" => "video/x-msvideo",
+                ".wmv" => "video/x-ms-wmv",
+                ".mkv" => "video/x-matroska",
+                ".flv" => "video/x-flv",
+                ".3gp" => "video/3gpp",
+                ".mp3" => "audio/mpeg",
+                ".wav" => "audio/wav",
+                ".flac" => "audio/flac",
+                ".aac" => "audio/aac",
+                ".m4a" => "audio/mp4",
+                ".ogg" => "audio/ogg",
                 ".pdf" => "application/pdf",
                 ".txt" => "text/plain",
                 ".zip" => "application/zip",
@@ -964,16 +988,20 @@ namespace Local_Network_Messenger
             };
         }
 
-        private static bool IsImageFile(string fileName, string? contentType)
+        private static bool IsPreviewableFile(string fileName, string? contentType)
         {
             if (!string.IsNullOrWhiteSpace(contentType) &&
-                contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+                (contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+                 contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase) ||
+                 contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase)))
             {
                 return true;
             }
 
             var ext = Path.GetExtension(fileName).ToLowerInvariant();
-            return ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp";
+            return ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp" or ".tif" or ".tiff" or ".heic" or ".heif" or ".svg"
+                or ".mp4" or ".m4v" or ".mov" or ".webm" or ".avi" or ".wmv" or ".mkv" or ".flv" or ".3gp"
+                or ".mp3" or ".wav" or ".flac" or ".aac" or ".m4a" or ".ogg";
         }
 
         private static string? TryBuildImagePreviewFromBase64(
@@ -982,7 +1010,7 @@ namespace Local_Network_Messenger
             long sizeBytes,
             string base64)
         {
-            if (!IsImageFile(fileName, contentType))
+            if (!IsPreviewableFile(fileName, contentType))
             {
                 return null;
             }
@@ -1003,7 +1031,7 @@ namespace Local_Network_Messenger
             string? contentType,
             long sizeBytes)
         {
-            if (!IsImageFile(filePath, contentType))
+            if (!IsPreviewableFile(filePath, contentType))
             {
                 return null;
             }
@@ -1890,7 +1918,8 @@ namespace Local_Network_Messenger
                             CancellationToken.None,
                             null,
                             contentType,
-                            preview);
+                            preview,
+                            null);
                     }
                     catch (InvalidOperationException ex)
                     {
@@ -1951,7 +1980,8 @@ namespace Local_Network_Messenger
                             CancellationToken.None,
                             null,
                             request.ContentType,
-                            preview);
+                            preview,
+                            null);
                     }
                     catch (InvalidOperationException ex)
                     {
@@ -1961,6 +1991,52 @@ namespace Local_Network_Messenger
 
                     await SendResponseAsync(message, "chat.attach", true, new { message = messageDto, scan }, null);
                     _ = SendNetworkFileAsync(request.ThreadId, request.FileName, fileBytes, request.ContentType, messageDto.Id);
+                    return;
+                }
+                case "file.open":
+                {
+                    var request = DeserializePayload<FileActionRequest>(message.Payload);
+                    if (request == null || string.IsNullOrWhiteSpace(request.Path))
+                    {
+                        await SendErrorAsync(message, "Dosya yolu okunamadi.");
+                        return;
+                    }
+
+                    var fullPath = Path.GetFullPath(request.Path);
+                    var receivedRoot = Path.GetFullPath(AppPaths.ReceivedFilesPath);
+                    if (!fullPath.StartsWith(receivedRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await SendErrorAsync(message, "Dosya yolu izinli degil.");
+                        return;
+                    }
+
+                    if (!File.Exists(fullPath))
+                    {
+                        await SendErrorAsync(message, "Dosya bulunamadi.");
+                        return;
+                    }
+
+                    try
+                    {
+                        if (string.Equals(request.Action, "reveal", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{fullPath}\"")
+                            {
+                                UseShellExecute = true
+                            });
+                        }
+                        else
+                        {
+                            Process.Start(new ProcessStartInfo(fullPath) { UseShellExecute = true });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        await SendErrorAsync(message, $"Dosya acilamadi: {ex.Message}");
+                        return;
+                    }
+
+                    await SendResponseAsync(message, "file.open", true, new { message = "Dosya acildi." }, null);
                     return;
                 }
                 default:
